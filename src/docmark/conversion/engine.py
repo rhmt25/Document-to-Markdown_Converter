@@ -1,24 +1,22 @@
-"""Format-specific document conversion with shared output and error handling."""
+"""General purpose DOCX to Markdown conversion."""
 
 from __future__ import annotations
 
-from collections import Counter
 from dataclasses import dataclass, field
+import hashlib
 import mimetypes
 from pathlib import Path
 import re
-from typing import Callable
 from urllib.parse import quote
 
 
 class ConversionError(Exception):
-    """A document could not be converted into useful Markdown."""
+    """A DOCX document could not be converted."""
 
 
 @dataclass(frozen=True)
 class ConversionOptions:
     export_images: bool = True
-    cleanup_repeated_headers: bool = False
 
 
 @dataclass
@@ -30,385 +28,283 @@ class ConversionResult:
 
 
 class _ImageWriter:
-    """Extract embedded images to a source-named sibling directory."""
-
-    def __init__(self, source: Path, destination: Path, enabled: bool) -> None:
+    def __init__(self, destination: Path, enabled: bool) -> None:
         self.enabled = enabled
-        # Normally destination.stem matches source.stem; numbered conflict copies
-        # get their own media folder so their links and assets never collide.
         self.directory = destination.parent / destination.stem
-        self.relative_directory = destination.stem
         self.image_files: list[Path] = []
-        self._next_id = 1
+        self._names: dict[str, str] = {}
 
-    def add(self, data: bytes, content_type: str, fallback_name: str = "") -> str:
+    def add(self, data: bytes, content_type: str, source_key: str = "") -> str:
         if not self.enabled:
-            return "[Image not exported]"
-        extension = Path(fallback_name).suffix.lower()
-        if not extension:
-            extension = mimetypes.guess_extension(content_type) or ".bin"
-        if not re.fullmatch(r"\.[a-z0-9]{1,8}", extension):
-            extension = ".bin"
+            return "[Image omitted; image export is off]"
+        digest = hashlib.sha256(data).hexdigest()
+        key = source_key or digest
+        if key in self._names:
+            name = self._names[key]
+        else:
+            ext = mimetypes.guess_extension(content_type) or ".bin"
+            if ext == ".jpe":
+                ext = ".jpg"
+            self.directory.mkdir(parents=True, exist_ok=True)
+            name = f"image_{len(self._names) + 1:03d}{ext}"
+            (self.directory / name).write_bytes(data)
+            self._names[key] = name
+            self.image_files.append(self.directory / name)
+        relative = f"{self.directory.name}/{name}"
+        return f"![{Path(name).stem}]({quote(relative, safe='/._-')})"
 
-        self.directory.mkdir(parents=True, exist_ok=True)
-        filename = f"image_{self._next_id:03d}{extension}"
-        self._next_id += 1
-        image_path = self.directory / filename
-        image_path.write_bytes(data)
-        self.image_files.append(image_path)
-        relative = f"{self.relative_directory}/{filename}"
-        return f"![{Path(filename).stem}]({quote(relative, safe='/._-')})"
 
-
-def convert_document(
-    source: str | Path,
-    destination: str | Path,
-    options: ConversionOptions | None = None,
-) -> ConversionResult:
-    """Convert one supported source file and write UTF-8 Markdown to destination."""
-    source_path = Path(source)
-    destination_path = Path(destination)
-    settings = options or ConversionOptions()
-    extension = source_path.suffix.casefold()
-    image_writer = _ImageWriter(source_path, destination_path, settings.export_images)
-
+def convert_document(source: str | Path, destination: str | Path,
+                    options: ConversionOptions | None = None) -> ConversionResult:
+    """Convert one DOCX to UTF-8 Markdown, extracting embedded pictures optionally."""
+    source_path, destination_path = Path(source), Path(destination)
+    if source_path.suffix.casefold() != ".docx":
+        raise ConversionError("Only .docx files are supported.")
     if not source_path.is_file():
-        raise ConversionError(f"Source file does not exist: {source_path}")
-    if extension == ".docx":
-        markdown = _convert_docx(source_path, image_writer)
-    elif extension == ".pdf":
-        markdown = _convert_pdf(source_path, image_writer, settings)
-    elif extension == ".txt":
-        markdown = _decode_text(source_path.read_bytes())
-    elif extension == ".rtf":
-        markdown = _convert_rtf(source_path)
-    else:
-        raise ConversionError(f"Unsupported input format: {extension or '(no extension)'}")
-
-    markdown = _normalize_markdown(markdown)
-    if not markdown and not image_writer.image_files:
-        raise ConversionError("The document did not contain extractable text or images.")
-
-    try:
-        destination_path.parent.mkdir(parents=True, exist_ok=True)
-        destination_path.write_text(markdown, encoding="utf-8", newline="\n")
-    except OSError as error:
-        raise ConversionError(f"Could not write Markdown file: {error}") from error
-
-    return ConversionResult(
-        source=source_path,
-        destination=destination_path,
-        image_files=image_writer.image_files,
-    )
-
-
-def _convert_docx(source: Path, images: _ImageWriter) -> str:
+        raise ConversionError(f"Source DOCX does not exist: {source_path}")
+    writer = _ImageWriter(destination_path, (options or ConversionOptions()).export_images)
+    warnings: list[str] = []
     try:
         from docx import Document
         from docx.table import Table
         from docx.text.paragraph import Paragraph
         from docx.oxml.ns import qn
 
-        document = Document(source)
+        document = Document(source_path)
+        if any(section.header.paragraphs and any(p.text.strip() for p in section.header.paragraphs)
+               or section.footer.paragraphs and any(p.text.strip() for p in section.footer.paragraphs)
+               for section in document.sections):
+            warnings.append("Header/footer text was not inserted into the Markdown body.")
         blocks: list[str] = []
-        previous_was_list = False
-
-        def append_block(content: str, *, is_list: bool = False) -> None:
-            nonlocal previous_was_list
-            if blocks:
-                blocks.append("\n" if previous_was_list and is_list else "\n\n")
-            blocks.append(content)
-            previous_was_list = is_list
-
-        for content_block in document.iter_inner_content():
-            if isinstance(content_block, Table):
-                table_markdown = _docx_table(content_block, document, images, qn)
-                if table_markdown:
-                    append_block(table_markdown)
+        has_seen_content = False
+        for block in document.iter_inner_content():
+            if isinstance(block, Table):
+                rendered = _table(block, document, writer, qn, warnings)
+                if rendered:
+                    blocks.append(rendered)
+                    prior_list = False
                 continue
-            if not isinstance(content_block, Paragraph):
+            if not isinstance(block, Paragraph):
                 continue
-            paragraph = content_block
-            content = _docx_paragraph(paragraph, document, images, qn)
-            if not content.strip():
-                previous_was_list = False
+            rendered = _paragraph(block, document, writer, qn)
+            if not rendered.strip():
                 continue
-            style_name = paragraph.style.name if paragraph.style else ""
-            is_list = False
-            heading = re.match(r"Heading\s+(\d+)", style_name, re.IGNORECASE)
+            style = block.style.name if block.style else ""
+            style_id = block.style.style_id if block.style else ""
+            heading = re.match(r"Heading\s*(\d+)", style, re.I) or re.match(r"Heading([1-6])", style_id, re.I)
             if heading:
-                level = min(max(int(heading.group(1)), 1), 6)
-                content = f"{'#' * level} {content.strip()}"
-            elif style_name.casefold() == "title":
-                content = f"# {content.strip()}"
-            elif style_name.casefold() == "subtitle":
-                content = f"## {content.strip()}"
+                rendered = f"{'#' * min(max(int(heading.group(1)), 1), 6)} {rendered.strip()}"
+            elif style.casefold() == "title":
+                rendered = f"# {rendered.strip()}"
+            elif style.casefold() == "subtitle":
+                rendered = f"## {rendered.strip()}"
             else:
-                list_info = _docx_list_info(paragraph, document, qn)
-                if list_info:
-                    level, ordered = list_info
-                    marker = "1." if ordered else "-"
-                    content = f"{'  ' * level}{marker} {content.strip()}"
-                    is_list = True
-            append_block(content, is_list=is_list)
-
-        return "".join(blocks)
+                raw_text = block.text.strip()
+                inferred_title = (
+                    not has_seen_content and 8 <= len(raw_text) <= 180
+                    and raw_text == raw_text.upper()
+                    and any(char.isalpha() for char in raw_text)
+                    and not re.search(r"[.!?]$", raw_text)
+                    and any(run.bold for run in block.runs)
+                )
+                if inferred_title:
+                    rendered = f"# {rendered.strip()}"
+                info = _list_info(block, document, qn)
+                if info and not inferred_title:
+                    level, ordered = info
+                    rendered = f"{'  ' * level}{'1.' if ordered else '-'} {rendered.strip()}"
+            blocks.append(rendered)
+            has_seen_content = True
+        markdown = _normalize("\n\n".join(blocks))
+        if not markdown and not writer.image_files:
+            raise ConversionError("The DOCX did not contain extractable body text or images.")
+        destination_path.parent.mkdir(parents=True, exist_ok=True)
+        destination_path.write_text(markdown, encoding="utf-8", newline="\n")
+        return ConversionResult(source_path, destination_path, writer.image_files, warnings)
     except ConversionError:
         raise
     except Exception as error:
-        raise ConversionError(f"Could not read DOCX document: {error}") from error
+        raise ConversionError(f"Could not convert DOCX: {error}") from error
 
 
-def _docx_paragraph(paragraph, document, images: _ImageWriter, qn: Callable[[str], str]) -> str:
-    chunks: list[str] = []
-    for run in paragraph.runs:
-        text = run.text.replace("\r", "").replace("\n", "  \n")
-        if text:
-            if run.bold and run.italic:
-                text = f"***{text}***"
-            elif run.bold:
-                text = f"**{text}**"
-            elif run.italic:
-                text = f"*{text}*"
-            if run.underline:
-                text = f"<u>{text}</u>"
-            if run.font.strike:
-                text = f"~~{text}~~"
-            chunks.append(text)
+def _paragraph(paragraph, document, images: _ImageWriter, qn) -> str:
+    from docx.text.run import Run
+    parts: list[str] = []
 
-        for blip in run._element.xpath(".//a:blip"):
-            relationship_id = blip.get(qn("r:embed"))
-            if not relationship_id:
-                chunks.append("[Linked image]")
-                continue
-            relationship = document.part.rels.get(relationship_id)
-            if relationship is None:
-                chunks.append("[Image unavailable]")
-                continue
-            image_part = relationship.target_part
-            chunks.append(images.add(image_part.blob, image_part.content_type, image_part.partname.filename))
-    return "".join(chunks).strip()
+    def visit(element) -> None:
+        if element.tag in (qn("w:del"), qn("w:moveFrom")):
+            return
+        if element.tag == qn("w:r"):
+            run = Run(element, paragraph)
+            value = run.text.replace("\r", "").replace("\n", "  \n")
+            if value:
+                value = _format_run(value, run)
+                parts.append(value)
+            for blip in element.xpath(".//a:blip"):
+                rid = blip.get(qn("r:embed"))
+                rel = document.part.rels.get(rid) if rid else None
+                if rel is None:
+                    parts.append("[Image unavailable]")
+                else:
+                    image = rel.target_part
+                    parts.append(images.add(image.blob, image.content_type, rid))
+            for image_data in element.iter("{urn:schemas-microsoft-com:vml}imagedata"):
+                rid = image_data.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id")
+                rel = document.part.rels.get(rid) if rid else None
+                if rel is not None:
+                    image = rel.target_part
+                    parts.append(images.add(image.blob, image.content_type, rid))
+            return
+        if element.tag in (qn("m:oMath"), qn("m:oMathPara")):
+            latex = _math(element)
+            if latex:
+                parts.append(f"\uFFF0{latex}\uFFF1")
+            return
+        for child in element:
+            visit(child)
+
+    for child in paragraph._p:
+        visit(child)
+    value = "".join(parts).strip()
+    tokens = list(re.finditer("\uFFF0(.*?)\uFFF1", value))
+    for token in reversed(tokens):
+        context = value[:token.start()] + value[token.end():]
+        labels = re.findall(r"\((\d{1,3})\)", context)
+        is_display = len(tokens) == 1 and (not context.strip() or (labels and not re.sub(r"\s|\(\d{1,3}\)", "", context)))
+        math_body = token.group(1) + (f" \\tag{{{labels[-1]}}}" if is_display and labels else "")
+        math = f"$$\n{math_body}\n$$" if is_display else f"${math_body}$"
+        if is_display:
+            value = math
+        else:
+            value = value[:token.start()] + math + value[token.end():]
+    return value
 
 
-def _docx_list_info(paragraph, document, qn: Callable[[str], str]) -> tuple[int, bool] | None:
-    properties = paragraph._p.pPr
-    numbering = properties.numPr if properties is not None else None
-    if numbering is not None and numbering.numId is not None:
-        num_id = str(numbering.numId.val)
-        level = int(numbering.ilvl.val) if numbering.ilvl is not None else 0
-        ordered = _docx_numbering_is_ordered(document, num_id, level, qn)
-        return level, ordered
+def _format_run(value: str, run) -> str:
+    # Preserve spaces outside delimiters to avoid changing word boundaries.
+    leading = value[:len(value) - len(value.lstrip())]
+    trailing = value[len(value.rstrip()):]
+    core = value.strip()
+    if not core:
+        return value
+    if run.font.superscript:
+        core = f"<sup>{core}</sup>"
+    elif run.font.subscript:
+        core = f"<sub>{core}</sub>"
+    if run.font.strike:
+        core = f"~~{core}~~"
+    if run.underline:
+        core = f"<u>{core}</u>"
+    if run.italic:
+        core = f"*{core}*"
+    if run.bold:
+        core = f"**{core}**"
+    return leading + core + trailing
 
-    style_name = paragraph.style.name.casefold() if paragraph.style else ""
-    if style_name.startswith("list bullet"):
-        return 0, False
-    if style_name.startswith("list number"):
-        return 0, True
-    return None
+
+def _math(element) -> str:
+    ns = "{http://schemas.openxmlformats.org/officeDocument/2006/math}"
+    def direct(node, name):
+        child = node.find(ns + name)
+        return render(child) if child is not None else ""
+    def children(node):
+        return "".join(render(c) for c in node if not c.tag.endswith(("Pr", "Pr2")))
+    def render(node):
+        name = node.tag.rsplit("}", 1)[-1]
+        if name == "t":
+            text = node.text or ""
+            return r"\times " if text == "\ufffd" else text.replace("_", r"\_")
+        if name in {"oMath", "oMathPara", "e", "num", "den", "sub", "sup", "deg", "r", "fName", "lim"}:
+            return children(node)
+        if name == "f":
+            return rf"\frac{{{direct(node,'num')}}}{{{direct(node,'den')}}}"
+        if name == "rad":
+            degree, body = direct(node, "deg"), direct(node, "e")
+            return rf"\sqrt[{degree}]{{{body}}}" if degree else rf"\sqrt{{{body}}}"
+        if name == "sSub": return f"{direct(node,'e')}_{{{direct(node,'sub')}}}"
+        if name == "sSup": return f"{direct(node,'e')}^{{{direct(node,'sup')}}}"
+        if name == "sSubSup": return f"{direct(node,'e')}_{{{direct(node,'sub')}}}^{{{direct(node,'sup')}}}"
+        if name == "d": return rf"\left({direct(node,'e')}\right)"
+        if name == "nary":
+            props = node.find(ns + "naryPr")
+            ch = props.find(ns + "chr") if props is not None else None
+            op = ch.get(ns + "val", "∑") if ch is not None else "∑"
+            return rf"\{op}_{{{direct(node,'sub')}}}^{{{direct(node,'sup')}}} {direct(node,'e')}"
+        if name in {"bar", "acc", "groupChr"}:
+            return rf"\overline{{{direct(node,'e')}}}" if name == "bar" else rf"\hat{{{direct(node,'e')}}}"
+        return children(node)
+    return render(element).strip()
 
 
-def _docx_numbering_is_ordered(document, num_id: str, level: int, qn: Callable[[str], str]) -> bool:
+def _list_info(paragraph, document, qn):
+    ppr = paragraph._p.pPr
+    numpr = ppr.numPr if ppr is not None else None
+    if numpr is None or numpr.numId is None:
+        name = paragraph.style.name.casefold() if paragraph.style else ""
+        return (0, False) if name.startswith("list bullet") else ((0, True) if name.startswith("list number") else None)
+    num_id = str(numpr.numId.val)
+    level = int(numpr.ilvl.val) if numpr.ilvl is not None else 0
     numbering = document.part.numbering_part.element
-    for number in numbering.findall(qn("w:num")):
-        if number.get(qn("w:numId")) != num_id:
-            continue
-        abstract_id = number.find(qn("w:abstractNumId"))
-        if abstract_id is None:
-            break
+    for num in numbering.findall(qn("w:num")):
+        if num.get(qn("w:numId")) != num_id: continue
+        abstract_id = num.find(qn("w:abstractNumId"))
+        if abstract_id is None: break
         for abstract in numbering.findall(qn("w:abstractNum")):
-            if abstract.get(qn("w:abstractNumId")) != abstract_id.get(qn("w:val")):
-                continue
-            for level_element in abstract.findall(qn("w:lvl")):
-                if int(level_element.get(qn("w:ilvl"), "0")) != level:
-                    continue
-                format_element = level_element.find(qn("w:numFmt"))
-                return bool(format_element is not None and format_element.get(qn("w:val")) != "bullet")
-    return False
+            if abstract.get(qn("w:abstractNumId")) != abstract_id.get(qn("w:val")): continue
+            for lvl in abstract.findall(qn("w:lvl")):
+                if int(lvl.get(qn("w:ilvl"), "0")) == level:
+                    fmt = lvl.find(qn("w:numFmt"))
+                    return level, bool(fmt is not None and fmt.get(qn("w:val")) != "bullet")
+    return level, False
 
 
-def _docx_table(table, document, images: _ImageWriter, qn: Callable[[str], str]) -> str:
+def _table(table, document, images, qn, warnings: list[str]) -> str:
+    """Render a logical table grid; merged values repeat into their grid slots."""
     from docx.table import Table
     from docx.text.paragraph import Paragraph
-
+    tbl = table._tbl
+    grid_width = len(tbl.tblGrid.gridCol_lst) if tbl.tblGrid is not None else 0
+    grid_width = max(grid_width, max((len(row.cells) for row in table.rows), default=0))
     rows: list[list[str]] = []
+    seen_cells: set[object] = set()
+    cell_values: dict[object, str] = {}
     for row in table.rows:
-        cells: list[str] = []
+        rendered: list[str] = []
         for cell in row.cells:
-            paragraphs: list[str] = []
+            identity = cell._tc
+            if identity in seen_cells:
+                rendered.append(cell_values.get(identity, ""))
+                continue
+            seen_cells.add(identity)
+            content = []
             for block in cell.iter_inner_content():
                 if isinstance(block, Paragraph):
-                    paragraphs.append(_docx_paragraph(block, document, images, qn))
+                    content.append(_paragraph(block, document, images, qn))
                 elif isinstance(block, Table):
-                    nested = _docx_table(block, document, images, qn)
+                    nested = _table(block, document, images, qn, warnings)
                     if nested:
-                        paragraphs.append(nested)
-            cells.append(_clean_cell("\n".join(paragraphs)))
-        rows.append(cells)
-    if not rows:
+                        content.append(re.sub(r"\s*\|\s*", " / ", nested.replace("\n", " ")))
+                        warnings.append("A nested table was flattened inside its parent Markdown cell.")
+            cell_value = _cell("<br>".join(filter(None, content)))
+            cell_values[identity] = cell_value
+            rendered.append(cell_value)
+        rows.append((rendered + [""] * max(0, grid_width - len(rendered)))[:grid_width])
+    if not rows or not grid_width:
         return ""
-    width = max((len(row) for row in rows), default=0)
-    if not width:
-        return ""
-    rows = [row + [""] * (width - len(row)) for row in rows]
-    header = rows[0]
-    separator = ["---"] * width
-    body = rows[1:]
-    return "\n".join([_markdown_row(header), _markdown_row(separator), *(_markdown_row(row) for row in body)])
+    return "\n".join([_row(rows[0]), _row(["---"] * grid_width), *(_row(row) for row in rows[1:])])
 
 
-def _convert_pdf(source: Path, images: _ImageWriter, options: ConversionOptions) -> str:
-    try:
-        import pymupdf
-
-        document = pymupdf.open(source)
-        try:
-            return _convert_pdf_document(document, images, options)
-        finally:
-            document.close()
-    except ConversionError:
-        raise
-    except Exception as error:
-        raise ConversionError(f"Could not read PDF document: {error}") from error
+def _cell(value: str) -> str:
+    value = re.sub(r"\s*\n\s*", "<br>", value.strip())
+    return value.replace("|", r"\|")
 
 
-def _convert_pdf_document(document, images: _ImageWriter, options: ConversionOptions) -> str:
-    pages: list[str] = []
-    page_texts: list[str] = []
-    page_images: list[list[int]] = []
-    for page in document:
-        text = _pdf_page_content(page)
-        page_texts.append(text)
-        page_content = text
-        page_images.append([xref for xref, *_rest in page.get_images(full=True)])
-        if page_images[-1] and not images.enabled:
-            page_content = f"{page_content}\n\n[Image not exported]" if page_content else "[Image not exported]"
-        pages.append(page_content)
-
-    all_text = "\n".join(page_texts)
-    if len(re.sub(r"\s", "", all_text)) < 20:
-        has_images = any(page_images)
-        if has_images:
-            raise ConversionError(
-                "This PDF appears to be scanned or image-only. OCR is not included, so it has no extractable text."
-            )
-        raise ConversionError("This PDF contains no meaningful extractable text.")
-
-    if images.enabled:
-        seen_xrefs: set[int] = set()
-        for page_index, xrefs in enumerate(page_images):
-            for xref in xrefs:
-                if xref in seen_xrefs:
-                    continue
-                seen_xrefs.add(xref)
-                pages[page_index] = _extract_pdf_image(document, xref, images, pages[page_index])
-
-    if options.cleanup_repeated_headers:
-        pages = _remove_repeated_edge_lines(pages)
-    return "\n\n".join(page for page in pages if page.strip())
+def _row(values) -> str:
+    return "| " + " | ".join(_cell(str(v or "")) for v in values) + " |"
 
 
-def _pdf_page_content(page) -> str:
-    tables: list[tuple[float, str, object]] = []
-    try:
-        finder = page.find_tables()
-        for table in finder.tables:
-            extracted = table.extract()
-            markdown = _rows_to_markdown(extracted)
-            if markdown:
-                tables.append((float(table.bbox[1]), markdown, table.bbox))
-    except Exception:
-        # Text extraction remains useful when a PDF's table geometry is unreliable.
-        tables.clear()
-
-    text_blocks: list[tuple[float, float, str]] = []
-    for block in page.get_text("blocks", sort=True):
-        if len(block) < 5 or not isinstance(block[4], str) or not block[4].strip():
-            continue
-        if any(_bbox_overlap(block[:4], table_bbox) for _, _, table_bbox in tables):
-            continue
-        text_blocks.append((float(block[1]), float(block[0]), block[4].strip()))
-
-    events = [(top, left, text) for top, left, text in text_blocks]
-    events.extend((top, -1.0, markdown) for top, markdown, _bbox in tables)
-    events.sort(key=lambda event: (event[0], event[1]))
-    body = "\n\n".join(text for _, _, text in events)
-    return body
-
-
-def _extract_pdf_image(document, xref: int, images: _ImageWriter, page_content: str) -> str:
-    try:
-        extracted = document.extract_image(xref)
-    except Exception:
-        return f"{page_content}\n\n[Image unavailable]" if page_content else "[Image unavailable]"
-    if not extracted:
-        return page_content
-    image_markdown = images.add(
-        extracted["image"],
-        mimetypes.guess_type(f"image.{extracted.get('ext', 'bin')}")[0] or "application/octet-stream",
-        f"image.{extracted.get('ext', 'bin')}",
-    )
-    return f"{page_content}\n\n{image_markdown}" if page_content else image_markdown
-
-
-def _bbox_overlap(left, right) -> bool:
-    return not (left[2] <= right[0] or left[0] >= right[2] or left[3] <= right[1] or left[1] >= right[3])
-
-
-def _remove_repeated_edge_lines(pages: list[str]) -> list[str]:
-    if len(pages) < 2:
-        return pages
-    edge_lines: list[str] = []
-    for page in pages:
-        lines = [line.strip() for line in page.splitlines() if line.strip()]
-        edge_lines.extend(line for line in lines[:2] + lines[-2:] if len(line) <= 100)
-    threshold = max(2, int(len(pages) * 0.6 + 0.999))
-    repeated = {line for line, count in Counter(edge_lines).items() if count >= threshold}
-    if not repeated:
-        return pages
-    return ["\n".join(line for line in page.splitlines() if line.strip() not in repeated) for page in pages]
-
-
-def _convert_rtf(source: Path) -> str:
-    try:
-        from striprtf.striprtf import rtf_to_text
-
-        raw = _decode_text(source.read_bytes())
-        return rtf_to_text(raw)
-    except Exception as error:
-        raise ConversionError(f"Could not read RTF document: {error}") from error
-
-
-def _decode_text(data: bytes) -> str:
-    for encoding in ("utf-8-sig", "utf-8", "utf-16", "cp1252"):
-        try:
-            return data.decode(encoding)
-        except UnicodeDecodeError:
-            continue
-    return data.decode("utf-8", errors="replace")
-
-
-def _normalize_markdown(markdown: str) -> str:
-    markdown = markdown.replace("\r\n", "\n").replace("\r", "\n").replace("\x00", "")
-    markdown = "\n".join(line.rstrip() for line in markdown.splitlines())
-    markdown = re.sub(r"\n{3,}", "\n\n", markdown)
-    return markdown.strip() + ("\n" if markdown.strip() else "")
-
-
-def _clean_cell(value: str | None) -> str:
-    return (value or "").replace("\r", "").replace("\n", "<br>").replace("|", "\\|").strip()
-
-
-def _markdown_row(values) -> str:
-    return "| " + " | ".join(_clean_cell(str(value) if value is not None else "") for value in values) + " |"
-
-
-def _rows_to_markdown(rows) -> str:
-    normalized = [[_clean_cell(value) for value in row] for row in rows if row]
-    if not normalized:
-        return ""
-    width = max(len(row) for row in normalized)
-    normalized = [row + [""] * (width - len(row)) for row in normalized]
-    return "\n".join(
-        [_markdown_row(normalized[0]), _markdown_row(["---"] * width)]
-        + [_markdown_row(row) for row in normalized[1:]]
-    )
+def _normalize(value: str) -> str:
+    value = value.replace("\r\n", "\n").replace("\r", "\n").replace("\x00", "")
+    value = "\n".join(line.rstrip() for line in value.splitlines())
+    value = re.sub(r"\n{3,}", "\n\n", value)
+    return value.strip() + ("\n" if value.strip() else "")

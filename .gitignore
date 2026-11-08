@@ -18,6 +18,8 @@ build/
 dist/
 *.egg-info/
 pip-wheel-metadata/
+.packaged-*/
+.packaged-smoke/
 
 # Test and tool caches
 .pytest_cache/
@@ -40,3 +42,4 @@ Desktop.ini
 # Application logs and temporary files
 *.log
 *.tmp
+.debug-*.txt

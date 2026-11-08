@@ -1,16 +1,24 @@
 """Main workspace window for the desktop converter."""
 
 from pathlib import Path
+from html import escape
 import os
+import re
 import subprocess
 import sys
 
 from threading import Event
 
-from PySide6.QtCore import QObject, Qt, QThread, QTimer, QUrl, Signal, Slot
-from PySide6.QtGui import QAction, QCloseEvent, QDesktopServices, QFont
+from PySide6.QtCore import QObject, Qt, QThread, QTimer, QUrl, Signal, Slot, QSettings, QEvent
+from PySide6.QtGui import QAction, QCloseEvent, QDesktopServices, QFont, QIcon, QKeySequence, QShortcut, QTextDocument
+from PySide6.QtWidgets import QApplication, QLineEdit
+from PySide6.QtWebEngineWidgets import QWebEngineView
+from markdown import Markdown
+from latex2mathml.converter import convert as latex_to_mathml
+from PySide6.QtWebEngineCore import QWebEngineSettings
 from PySide6.QtWidgets import (
     QCheckBox,
+    QAbstractButton,
     QFileDialog,
     QFrame,
     QHBoxLayout,
@@ -24,7 +32,6 @@ from PySide6.QtWidgets import (
     QSplitter,
     QStatusBar,
     QTabWidget,
-    QTextBrowser,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
@@ -35,7 +42,53 @@ from .conversion import ConversionOptions
 from .conversion.worker import ConflictChoice, ConflictRequest, ConversionWorker, FileOutcome
 
 
-SUPPORTED_EXTENSIONS = {".docx", ".pdf", ".txt", ".rtf"}
+SUPPORTED_EXTENSIONS = {".docx"}
+
+
+def markdown_preview_html(markdown_text: str) -> str:
+    """Render Markdown to complete HTML, retaining DOCX HTML tags and equations."""
+    math_fragments: dict[str, str] = {}
+
+    def preserve_math(match: re.Match[str]) -> str:
+        latex = match.group(1).strip()
+        token = f"DOCMARKMATHPLACEHOLDER{len(math_fragments)}TOKEN"
+        label_match = re.search(r"\\tag\{([^}]*)\}", latex)
+        latex = re.sub(r"\\tag\{[^}]*\}", "", latex, count=1)
+        try:
+            rendered = latex_to_mathml(latex)
+            if label_match:
+                rendered = rendered.replace('display="inline"', 'display="block"')
+                rendered = rendered.replace("</math>", f'<mtext class="equation-label">({escape(label_match.group(1))})</mtext></math>')
+        except (ValueError, TypeError):
+            rendered = f'<code class="math-fallback">{escape(latex)}</code>'
+        math_fragments[token] = rendered
+        return token
+
+    # Protect formula syntax from Markdown punctuation handling.
+    markdown_text = re.sub(r"\$\$(.*?)\$\$", preserve_math, markdown_text, flags=re.DOTALL)
+    markdown_text = re.sub(r"\\\[(.*?)\\\]", preserve_math, markdown_text, flags=re.DOTALL)
+    markdown_text = re.sub(r"(?<!\\)\$(?!\$)(.+?)(?<!\\)\$", preserve_math, markdown_text)
+    markdown_text = re.sub(r"\\\((.*?)\\\)", preserve_math, markdown_text, flags=re.DOTALL)
+    body = Markdown(extensions=["tables", "fenced_code", "sane_lists", "nl2br"]).convert(markdown_text)
+    for token, mathml in math_fragments.items():
+        body = body.replace(token, mathml)
+
+    return f"""<!doctype html>
+<html><head><meta charset="utf-8"><style>
+body {{ font: 15px/1.65 'Segoe UI', sans-serif; color: #242b35; margin: 24px; overflow-wrap: anywhere; }}
+h1,h2,h3,h4 {{ line-height: 1.3; margin: 1.25em 0 .55em; }}
+p {{ margin: .7em 0 1em; }}
+img {{ display: block; max-width: min(100%, 760px); max-height: 65vh; width: auto; height: auto; object-fit: contain; margin: 1em auto; }}
+table {{ border-collapse: collapse; width: 100%; margin: 1em 0; display: block; overflow-x: auto; }}
+th,td {{ border: 1px solid #cbd3dc; padding: 7px 10px; vertical-align: top; }}
+th {{ background: #eef2f6; }}
+blockquote {{ border-left: 3px solid #94a3b8; margin-left: 0; padding-left: 1em; color: #526173; }}
+pre {{ white-space: pre-wrap; background: #f3f5f7; padding: 12px; border-radius: 6px; }}
+math[display="block"] {{ display: block; text-align: center; margin: 1em auto; overflow-x: auto; }}
+math[display="inline"] {{ white-space: nowrap; }}
+.equation-label {{ float: right; }}
+.math-fallback {{ white-space: pre-wrap; }}
+</style></head><body>{body}</body></html>"""
 
 
 class FolderScanner(QObject):
@@ -62,7 +115,7 @@ class FolderScanner(QObject):
                                 pending.append(Path(entry.path))
                             elif entry.is_file(follow_symlinks=False):
                                 path = Path(entry.path)
-                                if path.suffix.casefold() in SUPPORTED_EXTENSIONS:
+                                if path.suffix.casefold() in SUPPORTED_EXTENSIONS and not path.name.startswith("~$"):
                                     files.append(path)
                         except OSError as error:
                             errors.append(f"{entry.path}: {error}")
@@ -88,13 +141,35 @@ class MainWindow(QMainWindow):
         self._cancel_event: Event | None = None
         self._conversion_total = 0
         self._close_when_background_work_finishes = False
+        self.settings = QSettings(
+            QSettings.Format.IniFormat,
+            QSettings.Scope.UserScope,
+            "MarkDocx",
+            "MarkDocx",
+        )
+        if not self.settings.allKeys():
+            previous_settings = QSettings(
+                QSettings.Format.IniFormat,
+                QSettings.Scope.UserScope,
+                "DocMark",
+                "DocumentToMarkdownConverter",
+            )
+            for key in previous_settings.allKeys():
+                self.settings.setValue(key, previous_settings.value(key))
+        self._restored_checks: set[str] = set()
+        self._find_open = False
         self._build_ui()
         self._apply_theme()
+        self._restore_workspace()
 
     def _build_ui(self) -> None:
-        self.setWindowTitle("Document to Markdown Converter")
+        self.setWindowTitle("MarkDocx")
+        application_root = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parents[2]))
+        icon_path = application_root / "assets" / "markdocx.png"
+        if icon_path.is_file():
+            self.setWindowIcon(QIcon(str(icon_path)))
         self.resize(1420, 860)
-        self.setMinimumSize(980, 620)
+        self.setMinimumSize(1040, 660)
 
         root = QWidget()
         root_layout = QVBoxLayout(root)
@@ -102,9 +177,9 @@ class MainWindow(QMainWindow):
         root_layout.setSpacing(8)
 
         header = QHBoxLayout()
-        title = QLabel("Document to Markdown")
+        title = QLabel("MarkDocx")
         title.setObjectName("appTitle")
-        subtitle = QLabel("Convert, review, and refine your documents")
+        subtitle = QLabel("Convert Word documents, review, and refine Markdown")
         subtitle.setObjectName("muted")
         title_stack = QVBoxLayout()
         title_stack.setSpacing(1)
@@ -119,59 +194,82 @@ class MainWindow(QMainWindow):
             "When enabled, supported embedded images are extracted into a folder named after the source file."
         )
         header.addWidget(self.export_images)
-        self.clean_repeated_headers = QCheckBox("Clean repeated headers")
-        self.clean_repeated_headers.setToolTip(
-            "Optionally remove short lines repeated near the top or bottom of PDF pages."
-        )
-        header.addWidget(self.clean_repeated_headers)
-        self.convert_button = QPushButton("Convert")
+        self.convert_button = QPushButton("Convert checked")
         self.convert_button.setEnabled(False)
-        self.convert_button.setToolTip("Available after the conversion engine is implemented.")
-        self.convert_all_button = QPushButton("Convert All")
+        self.convert_button.setToolTip("Convert checked DOCX files (Enter)")
+        self.convert_all_button = QPushButton("Convert all DOCX (checked or not)")
         self.convert_all_button.setObjectName("primaryButton")
         self.convert_all_button.setEnabled(False)
-        self.convert_all_button.setToolTip("Available after the conversion queue is implemented.")
+        self.convert_all_button.setToolTip("Convert every DOCX in the input folder, whether checked or not (Ctrl+Enter)")
         self.cancel_button = QPushButton("Cancel")
         self.cancel_button.setEnabled(False)
-        self.convert_button.clicked.connect(lambda: self._start_conversion(single=True))
-        self.convert_all_button.clicked.connect(lambda: self._start_conversion(single=False))
+        self.convert_button.clicked.connect(lambda: self._start_conversion())
+        self.convert_all_button.clicked.connect(lambda: self._start_conversion(all_files=True))
         self.cancel_button.clicked.connect(self._cancel_conversion)
         header.addWidget(self.convert_button)
         header.addWidget(self.convert_all_button)
         header.addWidget(self.cancel_button)
         root_layout.addLayout(header)
 
+        folders = QFrame()
+        folders.setObjectName("folderBar")
+        folders_layout = QHBoxLayout(folders)
+        folders_layout.setContentsMargins(10, 6, 10, 6)
+        folders_layout.setSpacing(8)
+        folders_layout.addWidget(QLabel("Input"))
+        self.input_path_label = QLabel("No input folder selected")
+        self.input_path_label.setObjectName("pathLabel")
+        self.input_path_label.setToolTip("Recursive DOCX source folder")
+        folders_layout.addWidget(self.input_path_label, 1)
+        self.choose_input_button = QPushButton("Change…")
+        self.choose_input_button.setAccessibleName("Change input folder")
+        self.choose_input_button.clicked.connect(self._choose_input_folder)
+        folders_layout.addWidget(self.choose_input_button)
+        folders_layout.addSpacing(12)
+        folders_layout.addWidget(QLabel("Output"))
+        self.output_path_label = QLabel("No output folder selected")
+        self.output_path_label.setObjectName("pathLabel")
+        self.output_path_label.setToolTip("Folder for generated Markdown files")
+        folders_layout.addWidget(self.output_path_label, 1)
+        self.choose_output_button = QPushButton("Change…")
+        self.choose_output_button.setAccessibleName("Change output folder")
+        self.choose_output_button.clicked.connect(self._choose_output_folder)
+        folders_layout.addWidget(self.choose_output_button)
+        root_layout.addWidget(folders)
+
         workspace = QSplitter(Qt.Orientation.Horizontal)
+        self.workspace_splitter = workspace
         workspace.setChildrenCollapsible(False)
         workspace.addWidget(self._build_input_panel())
         workspace.addWidget(self._build_editor_panel())
         workspace.addWidget(self._build_output_panel())
-        workspace.setSizes([300, 800, 300])
+        workspace.setStretchFactor(0, 1)
+        workspace.setStretchFactor(1, 3)
+        workspace.setStretchFactor(2, 1)
         root_layout.addWidget(workspace, 1)
 
         self.activity = QPlainTextEdit()
         self.activity.setReadOnly(True)
         self.activity.setMaximumBlockCount(500)
         self.activity.setPlaceholderText("Activity and conversion messages will appear here.")
-        self.activity.setFixedHeight(92)
+        self.activity.setMaximumHeight(110)
+        self.activity.hide()
         root_layout.addWidget(self.activity)
 
         self.setCentralWidget(root)
         self._build_status_bar()
         self._build_menu()
+        self._build_shortcuts()
         self._log("Workspace ready. Choose input and output folders to begin.")
 
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        saved = self.settings.value("splitter_sizes")
+        sizes = [int(value) for value in saved] if saved else [300, 800, 300]
+        QTimer.singleShot(0, lambda: self.workspace_splitter.setSizes(sizes))
+
     def _build_input_panel(self) -> QFrame:
-        panel, layout = self._panel("INPUT WORKSPACE", "Choose source documents")
-        self.input_path_label = QLabel("No input folder selected")
-        self.input_path_label.setObjectName("pathLabel")
-        self.input_path_label.setWordWrap(True)
-        layout.addWidget(self.input_path_label)
-
-        self.choose_input_button = QPushButton("Choose Input Folder…")
-        self.choose_input_button.clicked.connect(self._choose_input_folder)
-        layout.addWidget(self.choose_input_button)
-
+        panel, layout = self._panel("SOURCE DOCX", "Choose a folder; subfolders are included")
         selection_row = QHBoxLayout()
         self.select_all = QCheckBox("Select all")
         self.select_all.setEnabled(False)
@@ -194,7 +292,7 @@ class MainWindow(QMainWindow):
         return panel
 
     def _build_editor_panel(self) -> QFrame:
-        panel, layout = self._panel("MARKDOWN EDITOR", "Edit content and preview the result")
+        panel, layout = self._panel("MARKDOWN", "Edit and preview the converted document")
         self.document_label = QLabel("Unsaved Markdown")
         self.document_label.setObjectName("muted")
         layout.addWidget(self.document_label)
@@ -208,14 +306,42 @@ class MainWindow(QMainWindow):
         editor_font.setStyleHint(QFont.StyleHint.Monospace)
         editor_font.setPointSize(10)
         self.editor.setFont(editor_font)
-        self.preview = QTextBrowser()
-        self.preview.setOpenExternalLinks(True)
+        self.preview = QWebEngineView()
+        self.preview.settings().setAttribute(QWebEngineSettings.WebAttribute.JavascriptEnabled, False)
+        self.preview.settings().setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, False)
         self.editor.textChanged.connect(self._refresh_preview)
         self.editor_tabs.addTab(self.editor, "Markdown")
         self.editor_tabs.addTab(self.preview, "Preview")
         layout.addWidget(self.editor_tabs, 1)
 
+        self.find_bar = QWidget()
+        find_layout = QHBoxLayout(self.find_bar)
+        find_layout.setContentsMargins(0, 0, 0, 0)
+        self.find_input = QLineEdit()
+        self.find_input.setPlaceholderText("Find in Markdown…")
+        self.find_input.setClearButtonEnabled(True)
+        self.find_input.textChanged.connect(self._update_find_status)
+        self.find_input.returnPressed.connect(lambda: self._find_next())
+        find_layout.addWidget(self.find_input, 1)
+        self.find_previous_button = QPushButton("Previous")
+        self.find_previous_button.clicked.connect(lambda: self._find_next(backward=True))
+        find_layout.addWidget(self.find_previous_button)
+        self.find_next_button = QPushButton("Next")
+        self.find_next_button.clicked.connect(self._find_next)
+        find_layout.addWidget(self.find_next_button)
+        self.find_status = QLabel("0 matches")
+        find_layout.addWidget(self.find_status)
+        close_find = QPushButton("×")
+        close_find.setAccessibleName("Close Find")
+        close_find.clicked.connect(lambda: self._close_find(return_to_editor=False))
+        find_layout.addWidget(close_find)
+        self.find_bar.hide()
+        layout.addWidget(self.find_bar)
+
         editor_actions = QHBoxLayout()
+        find_button = QPushButton("Find  Ctrl+F")
+        find_button.clicked.connect(self._show_find)
+        editor_actions.addWidget(find_button)
         editor_actions.addStretch(1)
         save_button = QPushButton("Save Markdown…")
         save_button.clicked.connect(self._save_markdown)
@@ -224,16 +350,7 @@ class MainWindow(QMainWindow):
         return panel
 
     def _build_output_panel(self) -> QFrame:
-        panel, layout = self._panel("OUTPUT WORKSPACE", "Choose where Markdown files are saved")
-        self.output_path_label = QLabel("No output folder selected")
-        self.output_path_label.setObjectName("pathLabel")
-        self.output_path_label.setWordWrap(True)
-        layout.addWidget(self.output_path_label)
-
-        self.choose_output_button = QPushButton("Choose Output Folder…")
-        self.choose_output_button.clicked.connect(self._choose_output_folder)
-        layout.addWidget(self.choose_output_button)
-
+        panel, layout = self._panel("OUTPUT MARKDOWN", "Open results here to edit or preview them")
         self.output_tree = QTreeWidget()
         self.output_tree.setHeaderHidden(True)
         self.output_tree.setRootIsDecorated(False)
@@ -256,6 +373,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(title)
         hint = QLabel(description)
         hint.setObjectName("muted")
+        hint.setWordWrap(True)
         layout.addWidget(hint)
         return panel, layout
 
@@ -273,12 +391,139 @@ class MainWindow(QMainWindow):
         save.triggered.connect(self._save_markdown)
         file_menu.addAction(save)
 
+    def _build_shortcuts(self) -> None:
+        self.find_shortcut = QShortcut(QKeySequence.Find, self.editor)
+        self.find_shortcut.activated.connect(self._show_find)
+        app = QApplication.instance()
+        if app:
+            app.installEventFilter(self)
+
+    def _shortcut_convert(self) -> None:
+        focus = QApplication.focusWidget()
+        if self._find_open or self._conversion_thread is not None or self._active_modal():
+            return
+        if focus is not None and (focus is self.editor or self.editor.isAncestorOf(focus)):
+            return
+        if isinstance(focus, (QLineEdit, QPlainTextEdit, QAbstractButton)):
+            return
+        if self._checked_source_files():
+            self._start_conversion()
+
+    def _shortcut_convert_all(self) -> None:
+        if self._find_open or self._conversion_thread is not None or self._active_modal():
+            return
+        self._start_conversion(all_files=True)
+
+    def _active_modal(self) -> bool:
+        app = QApplication.instance()
+        return bool(app and app.activeModalWidget())
+
+    def _show_find(self) -> None:
+        self._find_open = True
+        self.find_bar.show()
+        self.find_input.setFocus()
+        self.find_input.selectAll()
+        self._update_find_status()
+
+    def _close_find(self, *, return_to_editor: bool) -> None:
+        self._find_open = False
+        self.find_bar.hide()
+        if return_to_editor:
+            self.editor.setFocus()
+
+    def _find_next(self, backward: bool = False) -> None:
+        needle = self.find_input.text()
+        if not needle:
+            self._update_find_status()
+            return
+        flags = QTextDocument.FindFlag.FindBackward if backward else QTextDocument.FindFlag(0)
+        if not self.editor.find(needle, flags):
+            cursor = self.editor.textCursor()
+            cursor.movePosition(cursor.MoveOperation.End if backward else cursor.MoveOperation.Start)
+            self.editor.setTextCursor(cursor)
+            self.editor.find(needle, flags)
+        self._update_find_status()
+
+    def _update_find_status(self, *_args) -> None:
+        needle = self.find_input.text()
+        if not needle:
+            self.find_status.setText("0 matches")
+            return
+        count = self.editor.toPlainText().casefold().count(needle.casefold())
+        self.find_status.setText(f"{count} match" + ("es" if count != 1 else ""))
+
+    def eventFilter(self, watched, event) -> bool:
+        if (event.type() == QEvent.Type.KeyPress
+                and isinstance(watched, QWidget)
+                and (watched is self or self.isAncestorOf(watched))):
+            modifiers = event.modifiers()
+            is_enter = event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
+            if is_enter and modifiers == Qt.KeyboardModifier.ControlModifier:
+                if not self._find_open and not self._conversion_thread and not self._active_modal():
+                    self._shortcut_convert_all()
+                return True
+            if is_enter and modifiers == Qt.KeyboardModifier.NoModifier:
+                focus = QApplication.focusWidget()
+                if (focus is not None
+                        and not (focus is self.editor or self.editor.isAncestorOf(focus))
+                        and not isinstance(focus, (QLineEdit, QPlainTextEdit, QAbstractButton))
+                        and not self._find_open and not self._conversion_thread
+                        and not self._active_modal()):
+                    self._shortcut_convert()
+                    return True
+        if (self._find_open and watched is self.find_input
+                and event.type() == QEvent.Type.KeyPress
+                and event.key() == Qt.Key.Key_Escape):
+            self._close_find(return_to_editor=True)
+            return True
+        if self._find_open and event.type() == QEvent.Type.MouseButtonPress:
+            target = watched if isinstance(watched, QWidget) else QApplication.widgetAt(event.globalPosition().toPoint())
+            if target is not None and not (target is self.find_bar or self.find_bar.isAncestorOf(target)):
+                self._close_find(return_to_editor=False)
+        return super().eventFilter(watched, event)
+
+    def _restore_workspace(self) -> None:
+        input_path = self.settings.value("input_directory", "", str)
+        output_path = self.settings.value("output_directory", "", str)
+        self._restored_checks = set(self.settings.value("checked_sources", [], list))
+        if input_path and Path(input_path).is_dir():
+            self.input_directory = Path(input_path)
+            self.input_path_label.setText(input_path)
+            self._start_input_scan()
+        elif input_path:
+            self._log(f"Saved input folder is unavailable: {input_path}")
+        if output_path and Path(output_path).is_dir():
+            self.output_directory = Path(output_path)
+            self.output_path_label.setText(output_path)
+            self._refresh_output_files()
+        elif output_path:
+            self._log(f"Saved output folder is unavailable: {output_path}")
+        geometry = self.settings.value("window_geometry")
+        if geometry:
+            self.restoreGeometry(geometry)
+
+    def _save_workspace(self) -> None:
+        self.settings.setValue("input_directory", str(self.input_directory or ""))
+        self.settings.setValue("output_directory", str(self.output_directory or ""))
+        self.settings.setValue("checked_sources", [str(p) for p in self._checked_source_files()])
+        self.settings.setValue("window_geometry", self.saveGeometry())
+        self.settings.setValue("splitter_sizes", self.workspace_splitter.sizes())
+
     def _build_status_bar(self) -> None:
         status = QStatusBar()
         self.setStatusBar(status)
         self.selection_status = QLabel("0 files selected")
         status.addWidget(self.selection_status)
+        self.activity_toggle = QPushButton("Show activity")
+        self.activity_toggle.setFlat(True)
+        self.activity_toggle.clicked.connect(self._toggle_activity)
+        status.addPermanentWidget(self.activity_toggle)
         status.addPermanentWidget(QLabel("Ready"))
+
+    def _toggle_activity(self) -> None:
+        visible = not self.activity.isVisible()
+        self.activity.setVisible(visible)
+        self.activity_toggle.setText("Hide activity" if visible else "Show activity")
 
     def _choose_input_folder(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "Choose Input Folder")
@@ -286,6 +531,8 @@ class MainWindow(QMainWindow):
             return
         self.input_directory = Path(folder)
         self.input_path_label.setText(str(self.input_directory))
+        self._restored_checks.clear()
+        self._save_workspace()
         self._log(f"Input folder selected: {self.input_directory}")
         self._start_input_scan()
 
@@ -326,7 +573,7 @@ class MainWindow(QMainWindow):
             item.setToolTip(0, str(path))
             item.setData(0, Qt.ItemDataRole.UserRole, str(path))
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-            item.setCheckState(0, Qt.CheckState.Unchecked)
+            item.setCheckState(0, Qt.CheckState.Checked if str(path) in self._restored_checks else Qt.CheckState.Unchecked)
             self.input_tree.addTopLevelItem(item)
         self.input_tree.blockSignals(False)
         self.choose_input_button.setEnabled(True)
@@ -334,8 +581,10 @@ class MainWindow(QMainWindow):
         self.select_all.setEnabled(bool(files))
         self.select_all.setChecked(False)
         self._update_selection_count()
-        self.statusBar().showMessage(f"Found {len(files)} supported document(s).", 5000)
-        self._log(f"Found {len(files)} supported document(s).")
+        self.statusBar().showMessage(f"Found {len(files)} DOCX file(s).", 5000)
+        self._log(f"Found {len(files)} DOCX file(s).")
+        self._restored_checks.clear()
+        self._save_workspace()
         for error in errors[:10]:
             self._log(f"Skipped inaccessible path: {error}")
         if len(errors) > 10:
@@ -366,8 +615,9 @@ class MainWindow(QMainWindow):
         )
         self.selection_status.setText(f"{selected} of {total} files selected")
         is_converting = self._conversion_thread is not None
-        self.convert_button.setEnabled(selected == 1 and not is_converting)
-        self.convert_all_button.setEnabled(selected > 0 and not is_converting)
+        self.convert_button.setEnabled(selected > 0 and not is_converting)
+        self.convert_all_button.setEnabled(total > 0 and not is_converting)
+        self._save_workspace()
         if total and selected == total:
             self.select_all.blockSignals(True)
             self.select_all.setChecked(True)
@@ -385,28 +635,21 @@ class MainWindow(QMainWindow):
                 files.append(Path(item.data(0, Qt.ItemDataRole.UserRole)))
         return files
 
-    def _start_conversion(self, *, single: bool) -> None:
+    def _start_conversion(self, *, all_files: bool = False) -> None:
         if self._conversion_thread is not None:
             return
         if not self.output_directory:
             QMessageBox.information(self, "Choose output folder", "Choose an output folder before converting.")
             return
 
-        sources = self._checked_source_files()
-        if single:
-            if len(sources) != 1:
-                QMessageBox.information(self, "Select one file", "Check exactly one source file to convert it.")
-                return
-        elif not sources:
-            QMessageBox.information(self, "Select files", "Check one or more source files to convert.")
+        sources = self._all_source_files() if all_files else self._checked_source_files()
+        if not sources:
+            QMessageBox.information(self, "Select DOCX files", "Choose a source folder containing DOCX files first.")
             return
 
         self._cancel_event = Event()
         self._conversion_total = len(sources)
-        options = ConversionOptions(
-            export_images=self.export_images.isChecked(),
-            cleanup_repeated_headers=self.clean_repeated_headers.isChecked(),
-        )
+        options = ConversionOptions(export_images=self.export_images.isChecked())
         thread = QThread(self)
         worker = ConversionWorker(sources, self.output_directory, options, self._cancel_event)
         worker.moveToThread(thread)
@@ -429,8 +672,13 @@ class MainWindow(QMainWindow):
         self.select_all.setEnabled(False)
         self.input_tree.setEnabled(False)
         self.output_tree.setEnabled(False)
-        self._log(f"Started {'single-file' if single else 'batch'} conversion ({len(sources)} file(s)).")
+        action = "all DOCX in the source folder" if all_files else "checked DOCX files"
+        self._log(f"Started conversion of {action} ({len(sources)} file(s)).")
         thread.start()
+
+    def _all_source_files(self) -> list[Path]:
+        return [Path(self.input_tree.topLevelItem(i).data(0, Qt.ItemDataRole.UserRole))
+                for i in range(self.input_tree.topLevelItemCount())]
 
     @Slot(int, int, str)
     def _on_conversion_progress(self, current: int, total: int, filename: str) -> None:
@@ -446,6 +694,9 @@ class MainWindow(QMainWindow):
         dialog.setText(f"An output file with this name already exists:\n{request.destination}")
         dialog.setInformativeText(f"Source: {request.source.name}\nChoose what to do with this file.")
         overwrite = dialog.addButton("Overwrite", QMessageBox.ButtonRole.AcceptRole)
+        dialog.setDefaultButton(overwrite)
+        overwrite.setDefault(True)
+        overwrite.setText("Overwrite  ·  Enter")
         numbered_copy = dialog.addButton("Keep both (numbered copy)", QMessageBox.ButtonRole.ActionRole)
         skip = dialog.addButton("Skip this file", QMessageBox.ButtonRole.DestructiveRole)
         cancel = dialog.addButton("Cancel queue", QMessageBox.ButtonRole.RejectRole)
@@ -474,6 +725,8 @@ class MainWindow(QMainWindow):
     def _on_file_conversion_finished(self, outcome: FileOutcome) -> None:
         if outcome.status == "success":
             self._log(f"Converted: {outcome.source.name} → {outcome.destination.name if outcome.destination else ''}")
+            if " — " in outcome.message:
+                self._log(f"Note: {outcome.message.split(' — ', 1)[1]}")
         elif outcome.status == "skipped":
             self._log(f"Skipped: {outcome.source.name} (name conflict)")
         else:
@@ -536,6 +789,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Closing after background work finishes…")
             event.ignore()
             return
+        self._save_workspace()
         event.accept()
 
     def _maybe_close_after_background_work(self) -> None:
@@ -552,6 +806,7 @@ class MainWindow(QMainWindow):
             return
         self.output_directory = Path(folder)
         self.output_path_label.setText(str(self.output_directory))
+        self._save_workspace()
         self._refresh_output_files()
         self._log(f"Output folder selected: {self.output_directory}")
 
@@ -574,6 +829,7 @@ class MainWindow(QMainWindow):
             self.editor.setPlainText(path.read_text(encoding="utf-8"))
             self.current_markdown_path = path
             self.document_label.setText(path.name)
+            self.editor.document().setModified(False)
             self.editor_tabs.setCurrentWidget(self.editor)
             self.statusBar().showMessage(f"Opened {path.name}", 4000)
         except (OSError, UnicodeError) as error:
@@ -706,7 +962,12 @@ class MainWindow(QMainWindow):
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.parent)))
 
     def _refresh_preview(self) -> None:
-        self.preview.setMarkdown(self.editor.toPlainText())
+        base_url = QUrl()
+        if self.current_markdown_path:
+            base_url = QUrl.fromLocalFile(str(self.current_markdown_path.parent) + os.sep)
+        self.preview.setHtml(markdown_preview_html(self.editor.toPlainText()), base_url)
+        if self.current_markdown_path and self.editor.document().isModified():
+            self.document_label.setText(f"{self.current_markdown_path.name} • Unsaved changes")
 
     def _save_markdown(self) -> None:
         suggested = str(self.current_markdown_path) if self.current_markdown_path else "document.md"
@@ -722,6 +983,7 @@ class MainWindow(QMainWindow):
             path.write_text(self.editor.toPlainText(), encoding="utf-8", newline="\n")
             self.current_markdown_path = path
             self.document_label.setText(path.name)
+            self.editor.document().setModified(False)
             self._refresh_output_files()
             self._log(f"Saved Markdown: {path}")
         except OSError as error:
@@ -733,28 +995,32 @@ class MainWindow(QMainWindow):
     def _apply_theme(self) -> None:
         self.setStyleSheet(
             """
-            QMainWindow, QWidget { background: #1e1f22; color: #e6e6e6; }
-            QMenuBar, QMenu, QStatusBar { background: #25262a; color: #e6e6e6; }
+            QMainWindow, QWidget { background: #20242b; color: #e8edf4; }
+            QMenuBar, QMenu, QStatusBar { background: #282e38; color: #e8edf4; }
             QMenuBar::item { padding: 6px 9px; }
-            QFrame#workspacePanel { background: #25262a; border: 1px solid #383a40; border-radius: 7px; }
+            QFrame#workspacePanel { background: #282e38; border: 1px solid #3a4350; border-radius: 8px; }
+            QFrame#folderBar { background: #282e38; border: 1px solid #3a4350; border-radius: 7px; }
             QLabel#appTitle { font-size: 18px; font-weight: 650; }
             QLabel#panelHeading { color: #aeb5c0; font-size: 10px; font-weight: 700; letter-spacing: 1px; }
-            QLabel#muted { color: #9298a3; }
-            QLabel#pathLabel { color: #c6cad2; }
-            QPushButton { background: #34363d; border: 1px solid #454850; border-radius: 5px; padding: 7px 10px; }
-            QPushButton:hover { background: #41444c; }
-            QPushButton:disabled { color: #777b83; background: #2b2c30; }
-            QPushButton#primaryButton { background: #315b91; border-color: #3e70ac; font-weight: 600; }
-            QPushButton#primaryButton:hover { background: #3c6ba5; }
-            QPlainTextEdit, QTextBrowser, QTreeWidget, QTabWidget::pane {
-                background: #1b1c1f; border: 1px solid #383a40; border-radius: 4px;
-                selection-background-color: #315b91;
+            QLabel#muted { color: #a6b0be; }
+            QLabel#pathLabel { color: #d1d9e3; }
+            QPushButton { background: #343d4a; border: 1px solid #4b5869; border-radius: 6px; padding: 8px 11px; }
+            QPushButton:hover { background: #414e60; }
+            QPushButton:focus { border: 2px solid #83b9ff; }
+            QPushButton:disabled { color: #858d98; background: #2b3038; }
+            QPushButton#primaryButton { background: #2769a9; border-color: #4386c4; font-weight: 600; }
+            QPushButton#primaryButton:hover { background: #347ab9; }
+            QPlainTextEdit, QWebEngineView, QTreeWidget, QTabWidget::pane {
+                background: #1d2229; border: 1px solid #3a4350; border-radius: 5px;
+                selection-background-color: #2769a9;
             }
             QTreeWidget::item { padding: 4px 2px; }
             QTreeWidget::item:alternate { background: #222327; }
-            QTabBar::tab { background: #292a2f; padding: 7px 14px; border: 1px solid #383a40; }
-            QTabBar::tab:selected { background: #1b1c1f; }
+            QTabBar::tab { background: #303742; padding: 8px 14px; border: 1px solid #3a4350; }
+            QTabBar::tab:selected { background: #1d2229; }
             QCheckBox { spacing: 7px; }
+            QLineEdit { background: #1d2229; border: 1px solid #4b5869; border-radius: 5px; padding: 7px; }
+            QLineEdit:focus { border: 2px solid #83b9ff; }
             """
         )
 

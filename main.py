@@ -1,4 +1,4 @@
-"""Application entry point for Document to Markdown Converter."""
+"""Application entry point for MarkDocx."""
 
 import sys
 
@@ -9,8 +9,8 @@ from src.docmark.main_window import MainWindow
 
 def main() -> int:
     app = QApplication(sys.argv)
-    app.setApplicationName("Document to Markdown Converter")
-    app.setOrganizationName("Document to Markdown Converter")
+    app.setApplicationName("MarkDocx")
+    app.setOrganizationName("MarkDocx")
     app.setStyle("Fusion")
 
     window = MainWindow()

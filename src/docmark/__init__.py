@@ -1,1 +1,1 @@
-"""Document to Markdown desktop application."""
+"""MarkDocx desktop application."""

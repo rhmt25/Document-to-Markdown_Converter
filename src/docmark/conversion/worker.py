@@ -81,8 +81,11 @@ class ConversionWorker(QObject):
                     destination = self._numbered_destination(destination)
 
             try:
-                convert_document(source, destination, self.options)
-                outcome = FileOutcome(source, destination, "success", f"Saved {destination.name}")
+                result = convert_document(source, destination, self.options)
+                note = f"Saved {destination.name}"
+                if result.warnings:
+                    note += " — " + " ".join(dict.fromkeys(result.warnings))
+                outcome = FileOutcome(source, destination, "success", note)
             except Exception as error:
                 outcome = FileOutcome(source, None, "failed", str(error))
             outcomes.append(outcome)
