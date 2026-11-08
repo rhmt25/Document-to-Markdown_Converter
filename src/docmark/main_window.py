@@ -5,8 +5,10 @@ import os
 import subprocess
 import sys
 
-from PySide6.QtCore import QObject, Qt, QThread, QUrl, Signal, Slot
-from PySide6.QtGui import QAction, QDesktopServices, QFont
+from threading import Event
+
+from PySide6.QtCore import QObject, Qt, QThread, QTimer, QUrl, Signal, Slot
+from PySide6.QtGui import QAction, QCloseEvent, QDesktopServices, QFont
 from PySide6.QtWidgets import (
     QCheckBox,
     QFileDialog,
@@ -28,6 +30,9 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+from .conversion import ConversionOptions
+from .conversion.worker import ConflictChoice, ConflictRequest, ConversionWorker, FileOutcome
 
 
 SUPPORTED_EXTENSIONS = {".docx", ".pdf", ".txt", ".rtf"}
@@ -78,6 +83,11 @@ class MainWindow(QMainWindow):
         self._scan_thread: QThread | None = None
         self._scan_worker: FolderScanner | None = None
         self._scan_pending = False
+        self._conversion_thread: QThread | None = None
+        self._conversion_worker: ConversionWorker | None = None
+        self._cancel_event: Event | None = None
+        self._conversion_total = 0
+        self._close_when_background_work_finishes = False
         self._build_ui()
         self._apply_theme()
 
@@ -123,6 +133,9 @@ class MainWindow(QMainWindow):
         self.convert_all_button.setToolTip("Available after the conversion queue is implemented.")
         self.cancel_button = QPushButton("Cancel")
         self.cancel_button.setEnabled(False)
+        self.convert_button.clicked.connect(lambda: self._start_conversion(single=True))
+        self.convert_all_button.clicked.connect(lambda: self._start_conversion(single=False))
+        self.cancel_button.clicked.connect(self._cancel_conversion)
         header.addWidget(self.convert_button)
         header.addWidget(self.convert_all_button)
         header.addWidget(self.cancel_button)
@@ -217,9 +230,9 @@ class MainWindow(QMainWindow):
         self.output_path_label.setWordWrap(True)
         layout.addWidget(self.output_path_label)
 
-        choose = QPushButton("Choose Output Folder…")
-        choose.clicked.connect(self._choose_output_folder)
-        layout.addWidget(choose)
+        self.choose_output_button = QPushButton("Choose Output Folder…")
+        self.choose_output_button.clicked.connect(self._choose_output_folder)
+        layout.addWidget(self.choose_output_button)
 
         self.output_tree = QTreeWidget()
         self.output_tree.setHeaderHidden(True)
@@ -335,6 +348,8 @@ class MainWindow(QMainWindow):
         if self._scan_pending:
             self._scan_pending = False
             self._start_input_scan()
+        else:
+            self._maybe_close_after_background_work()
 
     def _set_all_checked(self, checked: bool) -> None:
         for index in range(self.input_tree.topLevelItemCount()):
@@ -350,6 +365,9 @@ class MainWindow(QMainWindow):
             for index in range(total)
         )
         self.selection_status.setText(f"{selected} of {total} files selected")
+        is_converting = self._conversion_thread is not None
+        self.convert_button.setEnabled(selected == 1 and not is_converting)
+        self.convert_all_button.setEnabled(selected > 0 and not is_converting)
         if total and selected == total:
             self.select_all.blockSignals(True)
             self.select_all.setChecked(True)
@@ -358,6 +376,175 @@ class MainWindow(QMainWindow):
             self.select_all.blockSignals(True)
             self.select_all.setChecked(False)
             self.select_all.blockSignals(False)
+
+    def _checked_source_files(self) -> list[Path]:
+        files: list[Path] = []
+        for index in range(self.input_tree.topLevelItemCount()):
+            item = self.input_tree.topLevelItem(index)
+            if item.checkState(0) == Qt.CheckState.Checked:
+                files.append(Path(item.data(0, Qt.ItemDataRole.UserRole)))
+        return files
+
+    def _start_conversion(self, *, single: bool) -> None:
+        if self._conversion_thread is not None:
+            return
+        if not self.output_directory:
+            QMessageBox.information(self, "Choose output folder", "Choose an output folder before converting.")
+            return
+
+        sources = self._checked_source_files()
+        if single:
+            if len(sources) != 1:
+                QMessageBox.information(self, "Select one file", "Check exactly one source file to convert it.")
+                return
+        elif not sources:
+            QMessageBox.information(self, "Select files", "Check one or more source files to convert.")
+            return
+
+        self._cancel_event = Event()
+        self._conversion_total = len(sources)
+        options = ConversionOptions(
+            export_images=self.export_images.isChecked(),
+            cleanup_repeated_headers=self.clean_repeated_headers.isChecked(),
+        )
+        thread = QThread(self)
+        worker = ConversionWorker(sources, self.output_directory, options, self._cancel_event)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._on_conversion_progress)
+        worker.conflict_requested.connect(self._resolve_output_conflict)
+        worker.file_finished.connect(self._on_file_conversion_finished)
+        worker.finished.connect(self._on_conversion_finished)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._clear_conversion_thread)
+
+        self._conversion_thread = thread
+        self._conversion_worker = worker
+        self.convert_button.setEnabled(False)
+        self.convert_all_button.setEnabled(False)
+        self.cancel_button.setEnabled(True)
+        self.choose_input_button.setEnabled(False)
+        self.choose_output_button.setEnabled(False)
+        self.select_all.setEnabled(False)
+        self.input_tree.setEnabled(False)
+        self.output_tree.setEnabled(False)
+        self._log(f"Started {'single-file' if single else 'batch'} conversion ({len(sources)} file(s)).")
+        thread.start()
+
+    @Slot(int, int, str)
+    def _on_conversion_progress(self, current: int, total: int, filename: str) -> None:
+        message = f"Converting {current}/{total}: {filename}"
+        self.statusBar().showMessage(message)
+        self._log(message)
+
+    @Slot(object)
+    def _resolve_output_conflict(self, request: ConflictRequest) -> None:
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("Output file already exists")
+        dialog.setIcon(QMessageBox.Icon.Warning)
+        dialog.setText(f"An output file with this name already exists:\n{request.destination}")
+        dialog.setInformativeText(f"Source: {request.source.name}\nChoose what to do with this file.")
+        overwrite = dialog.addButton("Overwrite", QMessageBox.ButtonRole.AcceptRole)
+        numbered_copy = dialog.addButton("Keep both (numbered copy)", QMessageBox.ButtonRole.ActionRole)
+        skip = dialog.addButton("Skip this file", QMessageBox.ButtonRole.DestructiveRole)
+        cancel = dialog.addButton("Cancel queue", QMessageBox.ButtonRole.RejectRole)
+        if request.allow_apply_to_all:
+            apply_all = QCheckBox("Apply this choice to all remaining conflicts")
+            dialog.setCheckBox(apply_all)
+        else:
+            apply_all = None
+        dialog.exec()
+
+        clicked = dialog.clickedButton()
+        if clicked is overwrite:
+            request.choice = ConflictChoice.OVERWRITE
+        elif clicked is numbered_copy:
+            request.choice = ConflictChoice.NUMBERED_COPY
+        elif clicked is skip:
+            request.choice = ConflictChoice.SKIP
+        elif clicked is cancel or clicked is None:
+            request.choice = ConflictChoice.CANCEL
+            if self._cancel_event is not None:
+                self._cancel_event.set()
+        request.apply_to_all = bool(apply_all and apply_all.isChecked())
+        request.response_ready.set()
+
+    @Slot(object)
+    def _on_file_conversion_finished(self, outcome: FileOutcome) -> None:
+        if outcome.status == "success":
+            self._log(f"Converted: {outcome.source.name} → {outcome.destination.name if outcome.destination else ''}")
+        elif outcome.status == "skipped":
+            self._log(f"Skipped: {outcome.source.name} (name conflict)")
+        else:
+            self._log(f"Failed: {outcome.source.name} — {outcome.message}")
+
+    @Slot(object)
+    def _on_conversion_finished(self, outcomes: list[FileOutcome]) -> None:
+        successful = [item for item in outcomes if item.status == "success" and item.destination]
+        skipped = sum(item.status == "skipped" for item in outcomes)
+        failed = sum(item.status == "failed" for item in outcomes)
+        total = self._conversion_total
+        completed = len(outcomes)
+        cancelled = self._cancel_event is not None and self._cancel_event.is_set()
+        remaining = max(0, total - completed)
+        summary = f"Finished: {len(successful)} converted, {skipped} skipped, {failed} failed"
+        if cancelled or remaining:
+            summary += f", {remaining} not processed"
+        self._log(summary + ".")
+        self.statusBar().showMessage(summary, 8000)
+        self._refresh_output_files()
+
+        if successful:
+            first = successful[0].destination
+            for index in range(self.output_tree.topLevelItemCount()):
+                item = self.output_tree.topLevelItem(index)
+                if Path(item.data(0, Qt.ItemDataRole.UserRole)) == first:
+                    self._open_output_item(item, 0)
+                    break
+        if self._conversion_thread is not None:
+            self._conversion_thread.quit()
+
+    def _cancel_conversion(self) -> None:
+        if self._cancel_event is None or self._cancel_event.is_set():
+            return
+        self._cancel_event.set()
+        self.cancel_button.setEnabled(False)
+        self.statusBar().showMessage("Cancel requested; the current file will finish first.")
+        self._log("Cancel requested; the current file will finish before the remaining queue stops.")
+
+    @Slot()
+    def _clear_conversion_thread(self) -> None:
+        self._conversion_worker = None
+        self._conversion_thread = None
+        self._cancel_event = None
+        self._conversion_total = 0
+        self.cancel_button.setEnabled(False)
+        self.choose_input_button.setEnabled(True)
+        self.choose_output_button.setEnabled(True)
+        self.input_tree.setEnabled(True)
+        self.output_tree.setEnabled(True)
+        self.select_all.setEnabled(self.input_tree.topLevelItemCount() > 0)
+        self._update_selection_count()
+        self._maybe_close_after_background_work()
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        if self._scan_thread is not None or self._conversion_thread is not None:
+            self._close_when_background_work_finishes = True
+            if self._conversion_thread is not None:
+                self._cancel_conversion()
+            self.statusBar().showMessage("Closing after background work finishes…")
+            event.ignore()
+            return
+        event.accept()
+
+    def _maybe_close_after_background_work(self) -> None:
+        if (
+            self._close_when_background_work_finishes
+            and self._scan_thread is None
+            and self._conversion_thread is None
+        ):
+            QTimer.singleShot(0, self.close)
 
     def _choose_output_folder(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "Choose Output Folder")

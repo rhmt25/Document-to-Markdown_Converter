@@ -4,10 +4,10 @@ Use this file to track implementation. Update it at every meaningful checkpoint 
 
 ## Current checkpoint
 
-- **Status:** Phases 1–3 are implemented. The conversion engine's DOCX, PDF, TXT, RTF, image export toggle, table handling, and scanned-PDF notice passed conversion smoke checks. Phase 4 remains.
-- **Current phase:** Phase 4 — Queue, conversion workflow, and conflicts.
-- **Next action:** Connect the engine to background single/batch workers; pass image and cleanup settings from the UI; implement cancellation and conflict handling.
-- **Last checked:** 2026-11-08 (Python 3.12; PySide6 6.12.0, python-docx 1.2.0, PyMuPDF 1.28.2, striprtf 0.0.35; `compileall` plus smoke conversions for all formats, image On/Off, PDF table, and scanned PDF).
+- **Status:** Phases 1–4 are implemented. Single/batch conversion, image and cleanup settings, cancellation, conflict choices, and result preview passed smoke checks. Interactive source/output context-action review remains open from Phase 2.
+- **Current phase:** Phase 4 — Queue, conversion workflow, and conflicts (implementation complete).
+- **Next action:** Review context actions in an interactive desktop session, then start Phase 5 PyInstaller packaging and Windows verification.
+- **Last checked:** 2026-11-08 (Python 3.12; PySide6 6.12.0, python-docx 1.2.0, PyMuPDF 1.28.2, striprtf 0.0.35; compile check and runtime smoke checks for conversion, conflicts, and cancellation).
 
 ## Phase 1 — Project foundation and UI shell
 
@@ -49,15 +49,15 @@ Use this file to track implementation. Update it at every meaningful checkpoint 
 
 ## Phase 4 — Queue, conversion workflow, and conflicts
 
-- [ ] Add background worker for single-file conversion with progress reporting.
-- [ ] Add sequential batch conversion for checked files.
-- [ ] Add Cancel behavior for current and pending work; report completed/cancelled/failed items.
-- [ ] Detect output filename conflicts and show choices only when a collision exists.
-- [ ] Support overwrite and numbered duplicate output names.
-- [ ] Support per-file conflict choice and apply-to-all choice for batch conflicts.
-- [ ] Connect generated Markdown to the editable view and save action.
-- [ ] Refresh output workspace and show success/failure notifications.
-- [ ] Check that the UI remains responsive during representative conversions.
+- [x] Add background worker for single-file conversion with progress reporting.
+- [x] Add sequential batch conversion for checked files.
+- [x] Add Cancel behavior for current and pending work; report completed/cancelled/failed items.
+- [x] Detect output filename conflicts and show choices only when a collision exists.
+- [x] Support overwrite and numbered duplicate output names.
+- [x] Support per-file conflict choice and apply-to-all choice for batch conflicts.
+- [x] Connect generated Markdown to the editable view and save action.
+- [x] Refresh output workspace and show success/failure notifications.
+- [x] Check background single/batch flow, conflict dialog/apply-to-all, and queue cancellation with temporary documents.
 
 ## Phase 5 — Packaging and Windows verification
 
@@ -74,6 +74,7 @@ Use this file to track implementation. Update it at every meaningful checkpoint 
 - Input formats: `.docx`, `.pdf`, `.txt`, `.rtf`.
 - Layout: input browser, editable Markdown editor/preview, output browser, bottom activity/status area.
 - Image export has a user-controlled On/Off setting; when enabled, extracted images go to a folder named after the source file, without extension, and Markdown references must resolve.
+- Numbered conflict copies receive a correspondingly numbered media folder, so each Markdown copy has independent media links.
 - Source file open/edit uses Windows-associated applications. Generated Markdown can be edited in-app and saved.
 - Conflict dialog appears only for actual collisions; batch workflow supports per-item decisions and apply-to-all.
 - Include queue cancellation. Do not include token estimation.
@@ -87,3 +88,4 @@ Use this file to track implementation. Update it at every meaningful checkpoint 
 - 2026-11-08: Completed Phase 2 workspace management: asynchronous recursive source scan, per-file checkboxes/select-all, output Markdown listing, and context actions for open, rename, delete, and reveal for both source and output files. Added `.gitignore` and untracked previously committed `__pycache__` bytecode from Git's index while retaining local files. `compileall` and an offscreen smoke check of async scanning, bulk selection, and output listing passed. Interactive file-action review remains pending. The offscreen Qt environment registers no fonts, so its screenshot cannot assess actual text rendering.
 - 2026-11-08: Added Windows virtual-environment run steps to `README.md` after the user encountered `ModuleNotFoundError: PySide6`; use the same interpreter for dependency installation and app launch.
 - 2026-11-08: Completed Phase 3 engine in `src/docmark/conversion/`: shared options/result/error API; DOCX headings, inline emphasis, lists, tables, embedded images (including table cells); PyMuPDF text/table/image extraction; image-only PDF detection; TXT encoding fallbacks; RTF text extraction; and optional repeated PDF edge-line cleanup. Added parser dependencies to `requirements.txt`, an opt-in cleanup toggle to the UI shell, and developer/API documentation. Installed the dependencies in the available Python 3.12 interpreter. `compileall` and manual temporary-document smoke checks passed for all four formats, DOCX media links plus On/Off, images in DOCX tables and PDFs, PDF table extraction, and the OCR-limit notice. Conversion actions remain unconnected pending Phase 4.
+- 2026-11-08: Completed Phase 4: wired Convert/Convert All to a sequential QThread worker, passed image-export and cleanup controls, added progress/result logging, cancel-after-current behavior, and conflict choices for overwrite, numbered copy, skip, or cancel. Batch conflict dialogs include apply-to-all. Successful output refreshes the output list and opens the first Markdown file in the editor. Numbered copies get matching numbered media folders. `compileall` and temporary-file smoke checks passed for the UI worker path, apply-to-all dialog, overwrite/skip/cancel decisions, and stopping pending queue items. Phase 5 packaging remains; interactive context-menu review is still pending.

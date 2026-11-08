@@ -34,8 +34,10 @@ class _ImageWriter:
 
     def __init__(self, source: Path, destination: Path, enabled: bool) -> None:
         self.enabled = enabled
-        self.directory = destination.parent / source.stem
-        self.relative_directory = source.stem
+        # Normally destination.stem matches source.stem; numbered conflict copies
+        # get their own media folder so their links and assets never collide.
+        self.directory = destination.parent / destination.stem
+        self.relative_directory = destination.stem
         self.image_files: list[Path] = []
         self._next_id = 1
 

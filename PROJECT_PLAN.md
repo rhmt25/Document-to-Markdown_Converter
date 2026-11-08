@@ -31,7 +31,7 @@ This document is the project source of truth for scope and decisions. Update `TO
 - Text extraction from scanned/image-only PDFs is not guaranteed without OCR. OCR is not in the initial scope unless explicitly added later; detect or report when a PDF yields no meaningful text.
 - Preserve non-UTF-8 text by decoding with appropriate fallbacks and emit Markdown as UTF-8. Normalize line endings and remove only clearly extraneous whitespace.
 - Keep conversion errors visible per file and continue processing other files in a batch where possible.
-- Ensure extracted media references in Markdown point to the generated source-named media folder and remain valid when the output is saved in the selected output workspace.
+- Ensure extracted media references in Markdown point to the generated source-named media folder and remain valid when the output is saved in the selected output workspace. If conflict handling creates a numbered Markdown copy, give that copy a matching numbered media folder to prevent asset collisions.
 
 ## Current parser choices and known limits
 

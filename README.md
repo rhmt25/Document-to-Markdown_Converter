@@ -4,9 +4,9 @@ Windows desktop application for converting documents into editable Markdown.
 
 ## Current status
 
-The PySide6 workspace shell, Phase 2 workspace/file management, and Phase 3 conversion engine are in place. The app can scan supported source files asynchronously, select files individually or in bulk, list Markdown outputs, and edit/save Markdown. Format conversion is available through the conversion engine API; connecting it to the app's Convert/Convert All buttons is planned for Phase 4.
+The PySide6 workspace shell, workspace/file management, conversion engine, and background conversion workflow are in place. The app can scan supported source files asynchronously, select files individually or in bulk, convert one or many documents, resolve output-name conflicts, and edit/save Markdown.
 
-The engine is available from `src.docmark.conversion`:
+The conversion engine is available from `src.docmark.conversion`:
 
 ```python
 from src.docmark.conversion import ConversionOptions, convert_document
