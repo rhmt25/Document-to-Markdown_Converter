@@ -33,6 +33,16 @@ This document is the project source of truth for scope and decisions. Update `TO
 - Keep conversion errors visible per file and continue processing other files in a batch where possible.
 - Ensure extracted media references in Markdown point to the generated source-named media folder and remain valid when the output is saved in the selected output workspace.
 
+## Current parser choices and known limits
+
+- **DOCX:** `python-docx`; top-level paragraphs and tables are emitted in document order. Paragraph styles, bold/italic/underline/strike, common list numbering, tables, and embedded images are supported. Images inside table cells are extracted. Complex merged-cell layouts can repeat content because Word cells may be shared.
+- **PDF:** PyMuPDF; text blocks use its reading-order sort and table detection where geometry permits. Detected table regions are represented as Markdown tables and skipped in the regular text block pass. Multi-column order and borderless/complex tables remain best-effort. Extracted PDF images are linked after the page text because their exact semantic position is not always recoverable.
+- **Scanned PDF:** OCR is not included. Image-only PDFs are detected and reported with that limitation.
+- **RTF:** `striprtf` converts RTF to readable plain text; rich RTF styling is not retained in this first implementation.
+- **Images disabled:** embedded DOCX/PDF image positions are represented by `[Image not exported]`; no media files are written.
+- **Optional PDF cleanup:** when enabled, short lines repeated near the top or bottom of multiple pages are removed. This can remove repeated content that is meaningful, so it is off by default.
+- **Unsupported fidelity:** footnotes/endnotes, tracked changes, comments, floating object positioning, and intricate table layout are not fully represented. Review important documents after conversion.
+
 ## Implementation phases
 
 ### Phase 1 — Project foundation and UI shell
