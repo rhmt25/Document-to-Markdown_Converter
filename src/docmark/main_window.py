@@ -1,9 +1,12 @@
 """Main workspace window for the desktop converter."""
 
 from pathlib import Path
+import os
+import subprocess
+import sys
 
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QAction, QFont
+from PySide6.QtCore import QObject, Qt, QThread, QUrl, Signal, Slot
+from PySide6.QtGui import QAction, QDesktopServices, QFont
 from PySide6.QtWidgets import (
     QCheckBox,
     QFileDialog,
@@ -11,6 +14,9 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QMenu,
+    QMessageBox,
+    QInputDialog,
     QPlainTextEdit,
     QPushButton,
     QSplitter,
@@ -27,6 +33,40 @@ from PySide6.QtWidgets import (
 SUPPORTED_EXTENSIONS = {".docx", ".pdf", ".txt", ".rtf"}
 
 
+class FolderScanner(QObject):
+    """Walk a folder off the UI thread and return supported documents."""
+
+    finished = Signal(object, list, list)
+
+    def __init__(self, root: Path) -> None:
+        super().__init__()
+        self.root = root
+
+    @Slot()
+    def run(self) -> None:
+        files: list[Path] = []
+        errors: list[str] = []
+        pending = [self.root]
+        while pending:
+            directory = pending.pop()
+            try:
+                with os.scandir(directory) as entries:
+                    for entry in entries:
+                        try:
+                            if entry.is_dir(follow_symlinks=False):
+                                pending.append(Path(entry.path))
+                            elif entry.is_file(follow_symlinks=False):
+                                path = Path(entry.path)
+                                if path.suffix.casefold() in SUPPORTED_EXTENSIONS:
+                                    files.append(path)
+                        except OSError as error:
+                            errors.append(f"{entry.path}: {error}")
+            except OSError as error:
+                errors.append(f"{directory}: {error}")
+        files.sort(key=lambda path: str(path).casefold())
+        self.finished.emit(self.root, files, errors)
+
+
 class MainWindow(QMainWindow):
     """Three-panel workspace shell; conversion actions are connected in later phases."""
 
@@ -35,6 +75,9 @@ class MainWindow(QMainWindow):
         self.input_directory: Path | None = None
         self.output_directory: Path | None = None
         self.current_markdown_path: Path | None = None
+        self._scan_thread: QThread | None = None
+        self._scan_worker: FolderScanner | None = None
+        self._scan_pending = False
         self._build_ui()
         self._apply_theme()
 
@@ -67,9 +110,12 @@ class MainWindow(QMainWindow):
         )
         header.addWidget(self.export_images)
         self.convert_button = QPushButton("Convert")
-        self.convert_button.setToolTip("Convert the selected source file (conversion engine is not connected yet).")
+        self.convert_button.setEnabled(False)
+        self.convert_button.setToolTip("Available after the conversion engine is implemented.")
         self.convert_all_button = QPushButton("Convert All")
         self.convert_all_button.setObjectName("primaryButton")
+        self.convert_all_button.setEnabled(False)
+        self.convert_all_button.setToolTip("Available after the conversion queue is implemented.")
         self.cancel_button = QPushButton("Cancel")
         self.cancel_button.setEnabled(False)
         header.addWidget(self.convert_button)
@@ -104,9 +150,9 @@ class MainWindow(QMainWindow):
         self.input_path_label.setWordWrap(True)
         layout.addWidget(self.input_path_label)
 
-        choose = QPushButton("Choose Input Folder…")
-        choose.clicked.connect(self._choose_input_folder)
-        layout.addWidget(choose)
+        self.choose_input_button = QPushButton("Choose Input Folder…")
+        self.choose_input_button.clicked.connect(self._choose_input_folder)
+        layout.addWidget(self.choose_input_button)
 
         selection_row = QHBoxLayout()
         self.select_all = QCheckBox("Select all")
@@ -123,6 +169,9 @@ class MainWindow(QMainWindow):
         self.input_tree.setSelectionMode(QTreeWidget.SelectionMode.ExtendedSelection)
         self.input_tree.itemChanged.connect(self._update_selection_count)
         self.input_tree.itemSelectionChanged.connect(self._update_selection_count)
+        self.input_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.input_tree.customContextMenuRequested.connect(self._input_context_menu)
+        self.input_tree.itemDoubleClicked.connect(self._open_source_item)
         layout.addWidget(self.input_tree, 1)
         return panel
 
@@ -172,6 +221,8 @@ class MainWindow(QMainWindow):
         self.output_tree.setRootIsDecorated(False)
         self.output_tree.setAlternatingRowColors(True)
         self.output_tree.itemDoubleClicked.connect(self._open_output_item)
+        self.output_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.output_tree.customContextMenuRequested.connect(self._output_context_menu)
         layout.addWidget(self.output_tree, 1)
         return panel
 
@@ -218,31 +269,67 @@ class MainWindow(QMainWindow):
         self.input_directory = Path(folder)
         self.input_path_label.setText(str(self.input_directory))
         self._log(f"Input folder selected: {self.input_directory}")
-        self._log("Folder scanning will be added in Phase 2.")
+        self._start_input_scan()
 
-    def _scan_input_folder(self) -> None:
-        """Initial lightweight scan; asynchronous scanning is planned for Phase 2."""
+    def _start_input_scan(self) -> None:
+        if self._scan_thread is not None:
+            self._scan_pending = True
+            return
+        if not self.input_directory:
+            return
+        self.choose_input_button.setEnabled(False)
+        self.input_tree.setEnabled(False)
+        self.select_all.setEnabled(False)
+        self.selection_status.setText("Scanning input folder…")
+        self.statusBar().showMessage("Scanning input folder…")
+        thread = QThread(self)
+        worker = FolderScanner(self.input_directory)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._finish_input_scan)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._clear_scan_thread)
+        self._scan_thread = thread
+        self._scan_worker = worker
+        thread.start()
+
+    @Slot(object, list, list)
+    def _finish_input_scan(self, scan_root: Path, files: list[Path], errors: list[str]) -> None:
+        if scan_root != self.input_directory:
+            self._scan_pending = True
+            return
         self.input_tree.blockSignals(True)
         self.input_tree.clear()
-        count = 0
-        if self.input_directory:
-            try:
-                for path in sorted(self.input_directory.rglob("*"), key=lambda item: str(item).casefold()):
-                    if path.is_file() and path.suffix.casefold() in SUPPORTED_EXTENSIONS:
-                        item = QTreeWidgetItem([path.name])
-                        item.setToolTip(0, str(path))
-                        item.setData(0, Qt.ItemDataRole.UserRole, str(path))
-                        item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-                        item.setCheckState(0, Qt.CheckState.Unchecked)
-                        self.input_tree.addTopLevelItem(item)
-                        count += 1
-            except OSError as error:
-                self._log(f"Could not scan input folder: {error}")
+        for path in files:
+            relative_path = path.relative_to(scan_root)
+            item = QTreeWidgetItem([str(relative_path)])
+            item.setToolTip(0, str(path))
+            item.setData(0, Qt.ItemDataRole.UserRole, str(path))
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(0, Qt.CheckState.Unchecked)
+            self.input_tree.addTopLevelItem(item)
         self.input_tree.blockSignals(False)
-        self.select_all.setEnabled(count > 0)
+        self.choose_input_button.setEnabled(True)
+        self.input_tree.setEnabled(True)
+        self.select_all.setEnabled(bool(files))
         self.select_all.setChecked(False)
         self._update_selection_count()
-        self._log(f"Found {count} supported document(s).")
+        self.statusBar().showMessage(f"Found {len(files)} supported document(s).", 5000)
+        self._log(f"Found {len(files)} supported document(s).")
+        for error in errors[:10]:
+            self._log(f"Skipped inaccessible path: {error}")
+        if len(errors) > 10:
+            self._log(f"{len(errors) - 10} additional scan warning(s) were omitted.")
+
+    @Slot()
+    def _clear_scan_thread(self) -> None:
+        self._scan_worker = None
+        self._scan_thread = None
+        if self._scan_pending:
+            self._scan_pending = False
+            self._start_input_scan()
 
     def _set_all_checked(self, checked: bool) -> None:
         for index in range(self.input_tree.topLevelItemCount()):
@@ -299,6 +386,132 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"Opened {path.name}", 4000)
         except (OSError, UnicodeError) as error:
             self._log(f"Could not open {path.name}: {error}")
+
+    def _open_source_item(self, item: QTreeWidgetItem, _column: int) -> None:
+        path = Path(item.data(0, Qt.ItemDataRole.UserRole))
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(path))):
+            self._log(f"Windows could not open {path.name} with an associated application.")
+
+    def _input_context_menu(self, position) -> None:
+        item = self.input_tree.itemAt(position)
+        if item is None:
+            return
+        menu = QMenu(self)
+        open_action = menu.addAction("Open source in Windows app")
+        rename_action = menu.addAction("Rename source file…")
+        delete_action = menu.addAction("Delete source file…")
+        menu.addSeparator()
+        reveal_action = menu.addAction("Reveal in File Explorer")
+        selected = menu.exec(self.input_tree.viewport().mapToGlobal(position))
+        path = Path(item.data(0, Qt.ItemDataRole.UserRole))
+        if selected == open_action:
+            self._open_source_item(item, 0)
+        elif selected == rename_action:
+            self._rename_file(path, source=True)
+        elif selected == delete_action:
+            self._delete_file(path, source=True)
+        elif selected == reveal_action:
+            self._reveal_in_explorer(path)
+
+    def _output_context_menu(self, position) -> None:
+        item = self.output_tree.itemAt(position)
+        if item is None:
+            return
+        menu = QMenu(self)
+        edit_action = menu.addAction("Edit in Markdown editor")
+        open_action = menu.addAction("Open with Windows app")
+        rename_action = menu.addAction("Rename output file…")
+        delete_action = menu.addAction("Delete output file…")
+        menu.addSeparator()
+        reveal_action = menu.addAction("Reveal in File Explorer")
+        selected = menu.exec(self.output_tree.viewport().mapToGlobal(position))
+        path = Path(item.data(0, Qt.ItemDataRole.UserRole))
+        if selected == edit_action:
+            self._open_output_item(item, 0)
+        elif selected == open_action:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+        elif selected == rename_action:
+            self._rename_file(path, source=False)
+        elif selected == delete_action:
+            self._delete_file(path, source=False)
+        elif selected == reveal_action:
+            self._reveal_in_explorer(path)
+
+    def _rename_file(self, path: Path, *, source: bool) -> None:
+        label = "source file" if source else "output file"
+        new_name, accepted = QInputDialog.getText(
+            self, "Rename file", f"New name for {label}:", text=path.name
+        )
+        if not accepted:
+            return
+        new_name = new_name.strip()
+        invalid_windows_name = any(character in new_name for character in '<>:"/\\|?*')
+        invalid_windows_name = invalid_windows_name or any(ord(character) < 32 for character in new_name)
+        if (
+            not new_name
+            or Path(new_name).name != new_name
+            or new_name in {".", ".."}
+            or new_name.endswith((" ", "."))
+            or invalid_windows_name
+        ):
+            QMessageBox.warning(self, "Invalid name", "Enter a file name without a folder path.")
+            return
+        if source and Path(new_name).suffix.casefold() != path.suffix.casefold():
+            QMessageBox.warning(self, "Keep the file type", "A source file must keep its current extension.")
+            return
+        if not source and Path(new_name).suffix.casefold() != ".md":
+            QMessageBox.warning(self, "Keep the Markdown extension", "An output file must keep the .md extension.")
+            return
+        destination = path.with_name(new_name)
+        if destination.exists() and destination != path:
+            QMessageBox.warning(self, "Name already exists", f"A file named {new_name} already exists.")
+            return
+        try:
+            path.rename(destination)
+            self._log(f"Renamed {label}: {path.name} → {destination.name}")
+            if source:
+                self._start_input_scan_after_rename()
+            else:
+                if self.current_markdown_path == path:
+                    self.current_markdown_path = destination
+                    self.document_label.setText(destination.name)
+                self._refresh_output_files()
+        except OSError as error:
+            QMessageBox.critical(self, "Rename failed", str(error))
+
+    def _start_input_scan_after_rename(self) -> None:
+        self._start_input_scan()
+
+    def _delete_file(self, path: Path, *, source: bool) -> None:
+        label = "source" if source else "output"
+        answer = QMessageBox.question(
+            self,
+            f"Delete {label} file?",
+            f"Permanently delete this {label} file?\n\n{path}",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            path.unlink()
+            self._log(f"Deleted {label} file: {path}")
+            if source:
+                self._start_input_scan()
+            else:
+                if self.current_markdown_path == path:
+                    self.current_markdown_path = None
+                    self.document_label.setText("Unsaved Markdown")
+                self._refresh_output_files()
+        except OSError as error:
+            QMessageBox.critical(self, "Delete failed", str(error))
+
+    @staticmethod
+    def _reveal_in_explorer(path: Path) -> None:
+        if sys.platform == "win32":
+            subprocess.Popen(["explorer.exe", f"/select,{path}"])
+        else:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.parent)))
 
     def _refresh_preview(self) -> None:
         self.preview.setMarkdown(self.editor.toPlainText())

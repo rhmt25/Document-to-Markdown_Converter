@@ -4,10 +4,10 @@ Use this file to track implementation. Update it at every meaningful checkpoint 
 
 ## Current checkpoint
 
-- **Status:** Phase 1 UI shell launches successfully with Python 3.12 and PySide6 6.12.0. Full interactive visual/resizing review is still pending.
-- **Current phase:** Phase 1 — Project foundation and UI shell.
-- **Next action:** Review the running UI interactively and resolve any layout issues; then begin asynchronous workspace scanning in Phase 2.
-- **Last checked:** 2026-11-08 (Python 3.12 found at `C:\Users\rahmat\AppData\Local\Programs\Python\Python312\python.exe`; PySide6 6.12.0 installed; source compilation and offscreen window-construction smoke check succeeded).
+- **Status:** Phase 1 is complete. Phase 2 workspace management is implemented; asynchronous scanning, bulk selection, and output listing passed a smoke check. Context menu actions still need interactive review.
+- **Current phase:** Phase 2 — Workspace and file management.
+- **Next action:** Review source/output context actions and Windows file association behavior interactively, then proceed to Phase 3 conversion engine.
+- **Last checked:** 2026-11-08 (Python 3.12 and PySide6 6.12.0; compile check, offscreen window resize/render, and Phase 2 async scan/selection/output-list smoke check succeeded).
 
 ## Phase 1 — Project foundation and UI shell
 
@@ -20,17 +20,18 @@ Use this file to track implementation. Update it at every meaningful checkpoint 
 - [x] Add image-export On/Off control (default On; conversion connection is pending).
 - [x] Add Convert, Convert All, and Cancel controls (actions are intentionally pending later phases).
 - [x] Check that the Python source compiles and the main window constructs in an offscreen smoke check.
-- [ ] Review the visible application and confirm panel resizing interactively.
+- [x] Confirm the main window responds to resizing and renders at 1200×720 in an offscreen UI check. (The offscreen Qt environment has no registered fonts, so text glyph rendering could not be visually assessed there.)
 
 ## Phase 2 — Workspace and file management
 
-- [ ] Add input and output folder pickers.
-- [ ] Scan input folders recursively for `.docx`, `.pdf`, `.txt`, and `.rtf` off the UI thread.
-- [ ] Add individual checkboxes, select-all, and bulk selection.
-- [ ] Display and refresh output files.
-- [ ] Add context actions for source and generated files with clear target labels.
-- [ ] Open source files using their Windows-associated application.
-- [ ] Add rename, delete (with confirmation), and reveal-in-Explorer actions as applicable.
+- [x] Add input and output folder pickers.
+- [x] Scan input folders recursively for `.docx`, `.pdf`, `.txt`, and `.rtf` off the UI thread.
+- [x] Add individual checkboxes, select-all, and bulk selection.
+- [x] Display and refresh output files.
+- [x] Add context actions for source and generated files with clear target labels.
+- [x] Open source files using the Windows-associated application (`QDesktopServices`).
+- [x] Add rename, delete (with confirmation), and reveal-in-Explorer actions as applicable.
+- [ ] Manually review context actions and Windows file-association behavior in an interactive desktop session.
 
 ## Phase 3 — Conversion engine
 
@@ -77,7 +78,9 @@ Use this file to track implementation. Update it at every meaningful checkpoint 
 - Conflict dialog appears only for actual collisions; batch workflow supports per-item decisions and apply-to-all.
 - Include queue cancellation. Do not include token estimation.
 - OCR for scanned PDFs is outside the initial scope; detect and report image-only PDFs.
+- `.gitignore` excludes Python bytecode/caches, virtual environments, build output, local environment files, and common OS/editor artifacts. Previously tracked bytecode was removed from the Git index while keeping local copies.
 
 ## Session log
 
 - 2026-11-08: Created the PySide6 workspace shell, source entry point, dependency list, and run instructions. Folder pickers and Markdown edit/preview/save/open are wired. Scanning and conversion controls remain placeholders for planned phases. Initial lookup missed Python because PATH exposed only the Windows Store alias; found Python 3.12 under the user's Local Programs directory. Installed requirements (`PySide6 6.12.0`), compiled the Python sources, and successfully constructed the main window offscreen (1420×860). No automated test suite was run. Interactive visual/resizing review remains pending.
+- 2026-11-08: Completed Phase 2 workspace management: asynchronous recursive source scan, per-file checkboxes/select-all, output Markdown listing, and context actions for open, rename, delete, and reveal for both source and output files. Added `.gitignore` and untracked previously committed `__pycache__` bytecode from Git's index while retaining local files. `compileall` and an offscreen smoke check of async scanning, bulk selection, and output listing passed. Interactive file-action review remains pending. The offscreen Qt environment registers no fonts, so its screenshot cannot assess actual text rendering.
