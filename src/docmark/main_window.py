@@ -109,6 +109,11 @@ class MainWindow(QMainWindow):
             "When enabled, supported embedded images are extracted into a folder named after the source file."
         )
         header.addWidget(self.export_images)
+        self.clean_repeated_headers = QCheckBox("Clean repeated headers")
+        self.clean_repeated_headers.setToolTip(
+            "Optionally remove short lines repeated near the top or bottom of PDF pages."
+        )
+        header.addWidget(self.clean_repeated_headers)
         self.convert_button = QPushButton("Convert")
         self.convert_button.setEnabled(False)
         self.convert_button.setToolTip("Available after the conversion engine is implemented.")

@@ -4,10 +4,10 @@ Use this file to track implementation. Update it at every meaningful checkpoint 
 
 ## Current checkpoint
 
-- **Status:** Phase 1 is complete. Phase 2 workspace management is implemented; asynchronous scanning, bulk selection, and output listing passed a smoke check. Context menu actions still need interactive review.
-- **Current phase:** Phase 2 — Workspace and file management.
-- **Next action:** Review source/output context actions and Windows file association behavior interactively, then proceed to Phase 3 conversion engine.
-- **Last checked:** 2026-11-08 (Python 3.12 and PySide6 6.12.0; compile check, offscreen window resize/render, and Phase 2 async scan/selection/output-list smoke check succeeded).
+- **Status:** Phases 1–3 are implemented. The conversion engine's DOCX, PDF, TXT, RTF, image export toggle, table handling, and scanned-PDF notice passed conversion smoke checks. Phase 4 remains.
+- **Current phase:** Phase 4 — Queue, conversion workflow, and conflicts.
+- **Next action:** Connect the engine to background single/batch workers; pass image and cleanup settings from the UI; implement cancellation and conflict handling.
+- **Last checked:** 2026-11-08 (Python 3.12; PySide6 6.12.0, python-docx 1.2.0, PyMuPDF 1.28.2, striprtf 0.0.35; `compileall` plus smoke conversions for all formats, image On/Off, PDF table, and scanned PDF).
 
 ## Phase 1 — Project foundation and UI shell
 
@@ -35,17 +35,17 @@ Use this file to track implementation. Update it at every meaningful checkpoint 
 
 ## Phase 3 — Conversion engine
 
-- [ ] Define shared converter interface, result type, and per-file error reporting.
-- [ ] Implement DOCX structure conversion (headings, paragraphs, emphasis, lists, tables).
-- [ ] Implement DOCX image extraction when enabled.
-- [ ] Implement PDF text/table extraction and reading-order fallback behavior.
-- [ ] Implement PDF image extraction when enabled and supported by the chosen parser.
-- [ ] Detect image-only/scanned PDFs and explain that OCR is not included.
-- [ ] Implement TXT decoding, UTF-8 output, and line-ending normalization.
-- [ ] Implement RTF conversion.
-- [ ] Add optional conservative header/footer/page-number cleanup.
-- [ ] Ensure media folder uses source filename (without extension) and Markdown links resolve.
-- [ ] Check representative files for each supported format and both image-export settings.
+- [x] Define shared converter interface, result type, and per-file error reporting.
+- [x] Implement DOCX structure conversion (headings, paragraphs, emphasis, lists, tables).
+- [x] Implement DOCX image extraction when enabled, including images in table cells.
+- [x] Implement PDF text/table extraction and sorted text-block reading-order fallback.
+- [x] Implement PDF image extraction when enabled and supported by PyMuPDF.
+- [x] Detect image-only/scanned PDFs and explain that OCR is not included.
+- [x] Implement TXT decoding, UTF-8 output, and line-ending normalization.
+- [x] Implement RTF to readable plain text conversion.
+- [x] Add optional conservative PDF repeated-edge-line cleanup (off by default).
+- [x] Ensure media folder uses source filename (without extension) and Markdown links resolve.
+- [x] Check representative files for each supported format and both image-export settings.
 
 ## Phase 4 — Queue, conversion workflow, and conflicts
 
@@ -78,9 +78,12 @@ Use this file to track implementation. Update it at every meaningful checkpoint 
 - Conflict dialog appears only for actual collisions; batch workflow supports per-item decisions and apply-to-all.
 - Include queue cancellation. Do not include token estimation.
 - OCR for scanned PDFs is outside the initial scope; detect and report image-only PDFs.
+- Conversion limits: PDF multi-column reading order and complex tables are best-effort; RTF rich styling, footnotes/endnotes, tracked changes, comments, and floating-object positioning are not fully preserved. See `PROJECT_PLAN.md`.
 - `.gitignore` excludes Python bytecode/caches, virtual environments, build output, local environment files, and common OS/editor artifacts. Previously tracked bytecode was removed from the Git index while keeping local copies.
 
 ## Session log
 
 - 2026-11-08: Created the PySide6 workspace shell, source entry point, dependency list, and run instructions. Folder pickers and Markdown edit/preview/save/open are wired. Scanning and conversion controls remain placeholders for planned phases. Initial lookup missed Python because PATH exposed only the Windows Store alias; found Python 3.12 under the user's Local Programs directory. Installed requirements (`PySide6 6.12.0`), compiled the Python sources, and successfully constructed the main window offscreen (1420×860). No automated test suite was run. Interactive visual/resizing review remains pending.
 - 2026-11-08: Completed Phase 2 workspace management: asynchronous recursive source scan, per-file checkboxes/select-all, output Markdown listing, and context actions for open, rename, delete, and reveal for both source and output files. Added `.gitignore` and untracked previously committed `__pycache__` bytecode from Git's index while retaining local files. `compileall` and an offscreen smoke check of async scanning, bulk selection, and output listing passed. Interactive file-action review remains pending. The offscreen Qt environment registers no fonts, so its screenshot cannot assess actual text rendering.
+- 2026-11-08: Added Windows virtual-environment run steps to `README.md` after the user encountered `ModuleNotFoundError: PySide6`; use the same interpreter for dependency installation and app launch.
+- 2026-11-08: Completed Phase 3 engine in `src/docmark/conversion/`: shared options/result/error API; DOCX headings, inline emphasis, lists, tables, embedded images (including table cells); PyMuPDF text/table/image extraction; image-only PDF detection; TXT encoding fallbacks; RTF text extraction; and optional repeated PDF edge-line cleanup. Added parser dependencies to `requirements.txt`, an opt-in cleanup toggle to the UI shell, and developer/API documentation. Installed the dependencies in the available Python 3.12 interpreter. `compileall` and manual temporary-document smoke checks passed for all four formats, DOCX media links plus On/Off, images in DOCX tables and PDFs, PDF table extraction, and the OCR-limit notice. Conversion actions remain unconnected pending Phase 4.
